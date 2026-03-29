@@ -53,7 +53,7 @@ job "filesystem-gateway" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/lobo235/filesystem-gateway:latest"
+        image = "gitea.big.netlobo.com/netlobo/filesystem-gateway:latest"
         ports = ["http"]
         volumes = [
           "/path/to/data:/mnt/data",

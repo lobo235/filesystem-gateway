@@ -201,10 +201,10 @@ git tag v1.0.0 && git push origin v1.0.0
 ```
 
 This triggers the Docker workflow which publishes:
-- `ghcr.io/lobo235/filesystem-gateway:v1.0.0`
-- `ghcr.io/lobo235/filesystem-gateway:v1.0`
-- `ghcr.io/lobo235/filesystem-gateway:latest`
-- `ghcr.io/lobo235/filesystem-gateway:<short-sha>`
+- `gitea.big.netlobo.com/netlobo/filesystem-gateway:v1.0.0`
+- `gitea.big.netlobo.com/netlobo/filesystem-gateway:v1.0`
+- `gitea.big.netlobo.com/netlobo/filesystem-gateway:latest`
+- `gitea.big.netlobo.com/netlobo/filesystem-gateway:<short-sha>`
 
 Version is embedded at build time: `-ldflags "-X main.version=v1.0.0"` — defaults to `"dev"` for local builds. Exposed in `GET /health` response and logged on startup.
 
