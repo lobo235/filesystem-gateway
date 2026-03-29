@@ -18,9 +18,9 @@ RUN apk add --no-cache ca-certificates zstd
 WORKDIR /app
 COPY --from=builder /build/filesystem-gateway .
 
-RUN adduser -D -u 1000 appuser
-USER appuser
-
+# Runs as root — this service manages files on behalf of other workloads
+# (mkdir, chown, extract archives). Security is enforced via bearer auth,
+# path traversal prevention, and NFS mount scope.
 EXPOSE 8080
 
 ENTRYPOINT ["/app/filesystem-gateway"]
