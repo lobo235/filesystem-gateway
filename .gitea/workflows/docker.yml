@@ -13,43 +13,48 @@ jobs:
   build-and-push:
     runs-on: host
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Checkout
+        run: |
+          git clone --depth 1 "${{ github.server_url }}/${{ github.repository }}.git" workspace
+          cd workspace
+          git fetch --tags --force
+          git checkout "${{ github.sha }}"
 
       - name: Log in to Gitea Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USER }}
-          password: ${{ secrets.REGISTRY_TOKEN }}
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${{ env.REGISTRY }}" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
 
-      - name: Determine version
-        id: version
+      - name: Determine version and tags
+        id: meta
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          cd workspace
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            MAJOR_MINOR=$(echo "$VERSION" | sed -E 's/^(v[0-9]+\.[0-9]+).*/\1/')
+            TAGS="${FULL_IMAGE}:${VERSION},${FULL_IMAGE}:${MAJOR_MINOR},${FULL_IMAGE}:latest,${FULL_IMAGE}:${SHA_SHORT}"
           else
-            echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+            VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+            TAGS="${FULL_IMAGE}:latest,${FULL_IMAGE}:${SHA_SHORT}"
           fi
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=,format=short
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+        run: |
+          cd workspace
+          IFS=',' read -ra TAG_ARRAY <<< "${{ steps.meta.outputs.tags }}"
+          TAG_FLAGS=""
+          for tag in "${TAG_ARRAY[@]}"; do
+            TAG_FLAGS="${TAG_FLAGS} -t ${tag}"
+          done
+          docker build ${TAG_FLAGS} --build-arg VERSION="${{ steps.meta.outputs.version }}" .
+          for tag in "${TAG_ARRAY[@]}"; do
+            docker push "${tag}"
+          done
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf workspace
