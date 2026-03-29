@@ -8,6 +8,7 @@ on:
 env:
   REGISTRY: gitea.big.netlobo.com
   IMAGE_NAME: netlobo/filesystem-gateway
+  JOB_NAME: filesystem-gateway
 
 jobs:
   build-and-push:
@@ -53,3 +54,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
+
+      - name: Deploy to Nomad
+        if: github.ref == 'refs/heads/main'
+        run: |
+          curl -sf -X PUT \
+            -H "X-Nomad-Token: ${{ secrets.NOMAD_TOKEN }}" \
+            "${{ secrets.NOMAD_ADDR }}/v1/var/nomad/jobs/${{ env.JOB_NAME }}" \
+            -H "Content-Type: application/json" \
+            -d '{"Namespace":"default","Path":"nomad/jobs/${{ env.JOB_NAME }}","Items":{"image_digest":"${{ steps.version.outputs.version }}-${{ github.sha }}"}}'

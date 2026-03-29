@@ -78,6 +78,12 @@ EOF
         DATA_DIR      = "/data"
       }
 
+
+      template {
+        data        = "{{ with nomadVar \"nomad/jobs/filesystem-gateway\" }}{{ .image_digest }}{{ end }}"
+        destination = "local/deploy-trigger"
+        change_mode = "restart"
+      }
       resources {
         cpu    = 200
         memory = 128
