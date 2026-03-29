@@ -3,8 +3,9 @@ export PATH := $(HOME)/bin/go/bin:$(PATH)
 BINARY  := filesystem-gateway
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
+ENV_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../.env
 
-.PHONY: build test cover lint run clean hooks
+.PHONY: build test cover lint run clean hooks deploy
 
 build:
 	go build -trimpath $(LDFLAGS) -o $(BINARY) ./cmd/server
@@ -27,3 +28,9 @@ hooks:
 
 clean:
 	rm -f $(BINARY) coverage.out
+
+deploy:
+	@set -a && . $(ENV_FILE) && set +a && \
+	echo "==> Restarting $(BINARY) in Nomad..." && \
+	nomad job restart -reschedule -yes $(BINARY) && \
+	echo "==> Done! $(BINARY) is redeploying."
