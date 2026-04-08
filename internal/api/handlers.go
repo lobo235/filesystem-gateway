@@ -54,7 +54,7 @@ func (s *Server) createServerHandler() http.HandlerFunc {
 			return
 		}
 		if !validServerName(req.Name) {
-			writeError(w, http.StatusBadRequest, "invalid_body", "server name must match ^[a-z0-9][a-z0-9-]{0,47}$")
+			writeError(w, http.StatusBadRequest, "invalid_body", "server name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$")
 			return
 		}
 		if err := s.nfs.CreateServer(req.Name, req.UID, req.GID); err != nil {
@@ -429,7 +429,7 @@ func (s *Server) migrateHandler() http.HandlerFunc {
 			return
 		}
 		if !validServerName(req.NewName) {
-			writeError(w, http.StatusBadRequest, "invalid_body", "new_name must match ^[a-z0-9][a-z0-9-]{0,47}$")
+			writeError(w, http.StatusBadRequest, "invalid_body", "new_name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$")
 			return
 		}
 		if err := s.nfs.Migrate(name, req.NewName); err != nil {

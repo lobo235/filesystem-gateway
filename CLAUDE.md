@@ -144,7 +144,7 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 
 ### Input Validation
 
-- **Server names:** `^[a-z0-9][a-z0-9-]{0,47}$`
+- **Server names:** `^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$` (supports optional single subdirectory, e.g., `minecraft/atm9`)
 
 ### Path Traversal Prevention
 
