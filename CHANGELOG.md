@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-04-16
+
+### Added
+- `GET /servers/{name}` — stat a single server directory; returns name, bytes, uid, gid, mode, mod_time. Returns 404 if the directory does not exist. Lets clients do "create if missing" in one round trip.
+- `POST /servers/{name}/chmod` — set permission bits on the server root directory (non-recursive). Request body `{"mode": "0770"}` accepts a 3-digit octal string with optional leading zero (`^0?[0-7]{3}$`). Returns 404 if the directory does not exist.
+- Server name validation widened to allow up to three path segments (e.g., `project/env/job`); previously capped at two. Each segment still constrained to `[a-z0-9][a-z0-9-]{0,47}`.
+
+## [v1.0.1] - 2026-04-07
+
 ### Fixed
 - Server name validation now accepts one level of subdirectory nesting (e.g., `minecraft/atm9`) — previously rejected names with `/`, breaking all Minecraft server creation via the MCP server which sends `minecraft/<name>` paths
 

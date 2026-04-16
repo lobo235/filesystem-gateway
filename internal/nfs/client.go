@@ -17,8 +17,18 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+// statOwner extracts uid/gid from an os.FileInfo. Returns (0, 0) on platforms
+// where the underlying syscall.Stat_t is unavailable.
+func statOwner(info os.FileInfo) (int, int) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid), int(st.Gid)
+	}
+	return 0, 0
+}
 
 // Client provides filesystem operations on the NFS-backed server volume.
 type Client interface {
@@ -30,6 +40,12 @@ type Client interface {
 	CreateServer(name string, uid, gid int) error
 	// DeleteServer removes a server directory.
 	DeleteServer(name string) error
+	// StatServer returns metadata for a single server directory.
+	// Returns an error containing "server not found" if the directory does not exist.
+	StatServer(name string) (*ServerInfo, error)
+	// ChmodServer sets the permission bits on a server's root directory only (non-recursive).
+	// Returns an error containing "server not found" if the directory does not exist.
+	ChmodServer(name string, mode os.FileMode) error
 	// DiskUsage returns the disk usage in bytes for a server directory.
 	DiskUsage(name string) (int64, error)
 	// ListFiles returns file entries at the given sub-path within a server directory.
@@ -66,6 +82,16 @@ type Client interface {
 	MoveFile(serverName, srcPath, dstPath string, uid, gid int) error
 	// MaxWriteFileSize returns the configured maximum write file size.
 	MaxWriteFileSize() int64
+}
+
+// ServerInfo describes a single server directory's metadata as returned by StatServer.
+type ServerInfo struct {
+	Name    string `json:"name"`
+	Bytes   int64  `json:"bytes"`
+	UID     int    `json:"uid"`
+	GID     int    `json:"gid"`
+	Mode    string `json:"mode"`
+	ModTime string `json:"mod_time"`
 }
 
 // FileEntry represents a file or directory in a listing.
@@ -288,6 +314,48 @@ func (c *client) DeleteServer(name string) error {
 		return fmt.Errorf("server not found: %s", name)
 	}
 	return os.RemoveAll(dir)
+}
+
+// StatServer returns metadata for a single server directory.
+func (c *client) StatServer(name string) (*ServerInfo, error) {
+	dir, err := c.SafePath(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("server not found: %s", name)
+		}
+		return nil, fmt.Errorf("stat server: %w", err)
+	}
+	uid, gid := statOwner(info)
+	return &ServerInfo{
+		Name:    name,
+		Bytes:   info.Size(),
+		UID:     uid,
+		GID:     gid,
+		Mode:    fmt.Sprintf("%04o", info.Mode().Perm()),
+		ModTime: info.ModTime().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// ChmodServer sets the permission bits on a server's root directory only (non-recursive).
+func (c *client) ChmodServer(name string, mode os.FileMode) error {
+	dir, err := c.SafePath(name)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("server not found: %s", name)
+		}
+		return fmt.Errorf("stat server: %w", err)
+	}
+	if err := os.Chmod(dir, mode.Perm()); err != nil {
+		return fmt.Errorf("chmod server: %w", err)
+	}
+	return nil
 }
 
 // DiskUsage returns the total size of a server directory in bytes.

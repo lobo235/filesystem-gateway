@@ -125,7 +125,9 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 | GET | `/health` | No | Returns `{"status":"ok","version":"..."}` |
 | GET | `/servers` | Yes | List server directories on NFS volume |
 | POST | `/servers` | Yes | Create server dir `{"name":"...","uid":N,"gid":N}` |
+| GET | `/servers/{name}` | Yes | Stat single dir; returns `{"name","bytes","uid","gid","mode":"0755","mod_time"}`; 404 if missing |
 | DELETE | `/servers/{name}` | Yes | Delete server dir (requires `?confirm=true`) |
+| POST | `/servers/{name}/chmod` | Yes | Set root dir mode (non-recursive) `{"mode":"0770"}` (octal string `^0?[0-7]{3}$`); 404 if missing |
 | POST | `/servers/{name}/download` | Yes | Start async download `{"url":"...","dest_path":"...","extract":bool,"uid":N,"gid":N,"mode":"overwrite\|skip_existing\|clean_first"}` returns 201 with `{"id":"...","status":"running"}` |
 | GET | `/servers/{name}/downloads/{downloadID}` | Yes | Download status/details |
 | GET | `/servers/{name}/archive-contents` | Yes | List archive entries (`?path=mods.zip`) supports .zip, .tar.gz, .tar.zst |
@@ -144,7 +146,7 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 
 ### Input Validation
 
-- **Server names:** `^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$` (supports optional single subdirectory, e.g., `minecraft/atm9`)
+- **Server names:** `^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47}){0,2}$` (supports up to two levels of subdirectory nesting, e.g., `minecraft/atm9` or `project/env/job`)
 
 ### Path Traversal Prevention
 

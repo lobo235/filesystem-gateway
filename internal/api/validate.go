@@ -6,10 +6,10 @@ import (
 	"strings"
 )
 
-// serverNameRegex validates server names: plain names ("myserver") or one level
-// of subdirectory nesting ("minecraft/myserver"). Each segment must be lowercase
-// alphanumeric with optional dashes, max 48 chars.
-var serverNameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$`)
+// serverNameRegex validates server names: plain names ("myserver") or up to two
+// levels of subdirectory nesting ("project/env/job"). Each segment must be
+// lowercase alphanumeric with optional dashes, max 48 chars.
+var serverNameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47}){0,2}$`)
 
 // AllowedHost represents a host (and optional path prefix) permitted for file downloads.
 type AllowedHost struct {

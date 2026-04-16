@@ -64,15 +64,21 @@ func TestValidServerName(t *testing.T) {
 		{"minecraft/atm9", true},
 		{"minecraft/horror-land", true},
 		{"category/sub", true},
+		{"project/env/job", true},
+		{"a/b/c", true},
+		{"chatbot/staging/api-1", true},
 		{"INVALID", false},
 		{"-starts-with-dash", false},
 		{"has spaces", false},
 		{"", false},
-		{"a/b/c", false},
+		{"a/b/c/d", false},
+		{"project/env/job/extra", false},
 		{"../etc", false},
 		{"/absolute", false},
 		{"minecraft/", false},
 		{"/minecraft/atm9", false},
+		{"a//b", false},
+		{"a/b/", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

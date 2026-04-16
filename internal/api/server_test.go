@@ -20,6 +20,9 @@ type mockNFS struct {
 	listErr          error
 	createErr        error
 	deleteErr        error
+	statInfo         *nfs.ServerInfo
+	statErr          error
+	chmodErr         error
 	diskUsage        int64
 	diskUsageErr     error
 	files            []nfs.FileEntry
@@ -50,7 +53,11 @@ func (m *mockNFS) SafePath(parts ...string) (string, error) { return "", nil }
 func (m *mockNFS) ListServers() ([]string, error)           { return m.servers, m.listErr }
 func (m *mockNFS) CreateServer(string, int, int) error      { return m.createErr }
 func (m *mockNFS) DeleteServer(string) error                { return m.deleteErr }
-func (m *mockNFS) DiskUsage(string) (int64, error)          { return m.diskUsage, m.diskUsageErr }
+func (m *mockNFS) StatServer(string) (*nfs.ServerInfo, error) {
+	return m.statInfo, m.statErr
+}
+func (m *mockNFS) ChmodServer(string, os.FileMode) error { return m.chmodErr }
+func (m *mockNFS) DiskUsage(string) (int64, error)       { return m.diskUsage, m.diskUsageErr }
 func (m *mockNFS) ListFiles(string, string) ([]nfs.FileEntry, error) {
 	return m.files, m.listFilesErr
 }
@@ -207,6 +214,163 @@ func TestDeleteServerMissingConfirm(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// --- Stat Server ---
+
+func TestStatServer(t *testing.T) {
+	info := &nfs.ServerInfo{
+		Name:    "mc-test",
+		Bytes:   2048,
+		UID:     1000,
+		GID:     1000,
+		Mode:    "0755",
+		ModTime: "2026-04-16T00:00:00Z",
+	}
+	s := newTestServer(&mockNFS{statInfo: info})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test", nil)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp nfs.ServerInfo
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Name != "mc-test" {
+		t.Errorf("name = %q, want mc-test", resp.Name)
+	}
+	if resp.Bytes != 2048 {
+		t.Errorf("bytes = %d, want 2048", resp.Bytes)
+	}
+	if resp.Mode != "0755" {
+		t.Errorf("mode = %q, want 0755", resp.Mode)
+	}
+}
+
+func TestStatServer_NotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{statErr: fmt.Errorf("server not found: mc-test")})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test", nil)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestStatServer_InvalidName(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/BAD_NAME", nil)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestStatServer_PathTraversal(t *testing.T) {
+	s := newTestServer(&mockNFS{statErr: nfs.ErrPathTraversal})
+	// Use a syntactically-valid name so we hit the handler's traversal branch
+	// rather than the upstream validServerName 400.
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test", nil)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "path_traversal" {
+		t.Errorf("code = %q, want path_traversal", resp.Code)
+	}
+}
+
+// --- Chmod Server ---
+
+func TestChmodServer(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	body := map[string]string{"mode": "0770"}
+	rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", body)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp map[string]string
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp["mode"] != "0770" {
+		t.Errorf("mode = %q, want 0770", resp["mode"])
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("status = %q, want ok", resp["status"])
+	}
+	if resp["name"] != "mc-test" {
+		t.Errorf("name = %q, want mc-test", resp["name"])
+	}
+}
+
+func TestChmodServer_ModeWithoutLeadingZero(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	body := map[string]string{"mode": "770"}
+	rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", body)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+}
+
+func TestChmodServer_InvalidMode(t *testing.T) {
+	cases := []string{"0778", "abc", "", "01000", "0-755", "9999"}
+	for _, mode := range cases {
+		t.Run(mode, func(t *testing.T) {
+			s := newTestServer(&mockNFS{})
+			body := map[string]string{"mode": mode}
+			rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", body)
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("mode=%q status = %d, want 400", mode, rr.Code)
+			}
+		})
+	}
+}
+
+func TestChmodServer_MissingMode(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", map[string]string{})
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestChmodServer_NotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{chmodErr: fmt.Errorf("server not found: mc-test")})
+	body := map[string]string{"mode": "0755"}
+	rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", body)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestChmodServer_InvalidName(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	body := map[string]string{"mode": "0755"}
+	rr := doRequest(s.Handler(), "POST", "/servers/BAD_NAME/chmod", body)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestChmodServer_PathTraversal(t *testing.T) {
+	s := newTestServer(&mockNFS{chmodErr: nfs.ErrPathTraversal})
+	body := map[string]string{"mode": "0755"}
+	rr := doRequest(s.Handler(), "POST", "/servers/mc-test/chmod", body)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "path_traversal" {
+		t.Errorf("code = %q, want path_traversal", resp.Code)
 	}
 }
 

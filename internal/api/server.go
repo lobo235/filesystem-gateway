@@ -42,7 +42,9 @@ func (s *Server) Handler() http.Handler {
 	// Server management.
 	mux.Handle("GET /servers", auth(http.HandlerFunc(s.listServersHandler())))
 	mux.Handle("POST /servers", auth(http.HandlerFunc(s.createServerHandler())))
+	mux.Handle("GET /servers/{name}", auth(http.HandlerFunc(s.statServerHandler())))
 	mux.Handle("DELETE /servers/{name}", auth(http.HandlerFunc(s.deleteServerHandler())))
+	mux.Handle("POST /servers/{name}/chmod", auth(http.HandlerFunc(s.chmodServerHandler())))
 
 	// File download.
 	mux.Handle("POST /servers/{name}/download", auth(http.HandlerFunc(s.downloadHandler())))

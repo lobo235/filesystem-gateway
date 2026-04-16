@@ -5,10 +5,15 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/lobo235/filesystem-gateway/internal/nfs"
 )
+
+// chmodModeRegex permits a 3-digit octal mode with an optional leading zero (e.g. "0770", "770").
+var chmodModeRegex = regexp.MustCompile(`^0?[0-7]{3}$`)
 
 const (
 	maxJSONBodySize = 64 * 1024 // 64KB for most JSON request bodies
@@ -54,7 +59,7 @@ func (s *Server) createServerHandler() http.HandlerFunc {
 			return
 		}
 		if !validServerName(req.Name) {
-			writeError(w, http.StatusBadRequest, "invalid_body", "server name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$")
+			writeError(w, http.StatusBadRequest, "invalid_body", "server name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47}){0,2}$")
 			return
 		}
 		if err := s.nfs.CreateServer(req.Name, req.UID, req.GID); err != nil {
@@ -95,6 +100,84 @@ func (s *Server) deleteServerHandler() http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"name": name, "status": "deleted"})
+	}
+}
+
+func (s *Server) statServerHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !validServerName(name) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
+			return
+		}
+		info, err := s.nfs.StatServer(name)
+		if err != nil {
+			if errors.Is(err, nfs.ErrPathTraversal) {
+				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
+				return
+			}
+			if strings.Contains(err.Error(), "server not found") {
+				writeError(w, http.StatusNotFound, "not_found", err.Error())
+				return
+			}
+			s.log.Error("stat server failed", "error", err, "server", name, "trace_id", traceIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to stat server")
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+	}
+}
+
+func (s *Server) chmodServerHandler() http.HandlerFunc {
+	type request struct {
+		Mode string `json:"mode"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !validServerName(name) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
+			return
+		}
+		limitBody(w, r, maxJSONBodySize)
+		var req request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid JSON body")
+			return
+		}
+		if req.Mode == "" {
+			writeError(w, http.StatusBadRequest, "missing_fields", "mode is required")
+			return
+		}
+		if !chmodModeRegex.MatchString(req.Mode) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "mode must match ^0?[0-7]{3}$")
+			return
+		}
+		// Parse as octal — regex guarantees 3 octal digits with optional leading zero.
+		parsed, err := strconv.ParseUint(req.Mode, 8, 32)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_body", "mode must be a valid octal value")
+			return
+		}
+		mode := os.FileMode(parsed) // #nosec G115 -- value bounded to 0o777 by regex
+		if err := s.nfs.ChmodServer(name, mode); err != nil {
+			if errors.Is(err, nfs.ErrPathTraversal) {
+				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
+				return
+			}
+			if strings.Contains(err.Error(), "server not found") {
+				writeError(w, http.StatusNotFound, "not_found", err.Error())
+				return
+			}
+			s.log.Error("chmod server failed", "error", err, "server", name, "trace_id", traceIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to chmod server")
+			return
+		}
+		// Echo the canonical octal form back to the caller.
+		writeJSON(w, http.StatusOK, map[string]string{
+			"name":   name,
+			"mode":   "0" + strings.TrimPrefix(req.Mode, "0"),
+			"status": "ok",
+		})
 	}
 }
 
@@ -429,7 +512,7 @@ func (s *Server) migrateHandler() http.HandlerFunc {
 			return
 		}
 		if !validServerName(req.NewName) {
-			writeError(w, http.StatusBadRequest, "invalid_body", "new_name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47})?$")
+			writeError(w, http.StatusBadRequest, "invalid_body", "new_name must match ^[a-z0-9][a-z0-9-]{0,47}(/[a-z0-9][a-z0-9-]{0,47}){0,2}$")
 			return
 		}
 		if err := s.nfs.Migrate(name, req.NewName); err != nil {

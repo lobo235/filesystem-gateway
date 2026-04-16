@@ -28,7 +28,9 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 | GET | `/health` | Health check (unauthenticated) |
 | GET | `/servers` | List server directories |
 | POST | `/servers` | Create server directory |
+| GET | `/servers/{name}` | Stat single directory (name, bytes, uid, gid, mode, mod_time); 404 if missing |
 | DELETE | `/servers/{name}` | Delete server directory (requires `?confirm=true`) |
+| POST | `/servers/{name}/chmod` | Set root directory mode (non-recursive); body `{"mode":"0770"}` |
 | POST | `/servers/{name}/download` | Start async download |
 | GET | `/servers/{name}/downloads/{downloadID}` | Download status |
 | GET | `/servers/{name}/archive-contents` | List archive entries |

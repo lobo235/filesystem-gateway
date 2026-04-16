@@ -266,6 +266,142 @@ func TestReadFileIsDirectory(t *testing.T) {
 	}
 }
 
+// --- StatServer ---
+
+func TestStatServer_Success(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Drop a small file so any size-aggregation logic has data to sum.
+	if err := os.WriteFile(filepath.Join(dir, "marker"), []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := c.StatServer("myserver")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Name != "myserver" {
+		t.Errorf("name = %q, want myserver", info.Name)
+	}
+	if info.Bytes < 0 {
+		t.Errorf("bytes = %d, want >= 0", info.Bytes)
+	}
+	if info.UID != os.Getuid() {
+		t.Errorf("uid = %d, want %d", info.UID, os.Getuid())
+	}
+	if info.GID != os.Getgid() {
+		t.Errorf("gid = %d, want %d", info.GID, os.Getgid())
+	}
+	if info.Mode != "0755" {
+		t.Errorf("mode = %q, want 0755", info.Mode)
+	}
+	if _, err := time.Parse(time.RFC3339, info.ModTime); err != nil {
+		t.Errorf("mod_time = %q, not RFC3339: %v", info.ModTime, err)
+	}
+}
+
+func TestStatServer_NotFound(t *testing.T) {
+	c, _ := newTestClient(t)
+	_, err := c.StatServer("nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent server")
+	}
+	if !strings.Contains(err.Error(), "server not found") {
+		t.Errorf("error = %q, want 'server not found'", err.Error())
+	}
+}
+
+func TestStatServer_PathTraversal(t *testing.T) {
+	c, _ := newTestClient(t)
+	_, err := c.StatServer("../escape")
+	if err != ErrPathTraversal {
+		t.Errorf("expected ErrPathTraversal, got %v", err)
+	}
+}
+
+func TestStatServer_NestedName(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "project", "env", "job")
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.StatServer("project/env/job")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Name != "project/env/job" {
+		t.Errorf("name = %q, want project/env/job", info.Name)
+	}
+	if info.Mode != "0750" {
+		t.Errorf("mode = %q, want 0750", info.Mode)
+	}
+}
+
+// --- ChmodServer ---
+
+func TestChmodServer_Success(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ChmodServer("myserver", 0o770); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o770 {
+		t.Errorf("perm = %04o, want 0770", got)
+	}
+}
+
+func TestChmodServer_NonRecursive(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver")
+	child := filepath.Join(dir, "child")
+	if err := os.MkdirAll(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ChmodServer("myserver", 0o700); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Child must remain at its original permissions.
+	info, err := os.Stat(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("child perm = %04o, want 0755 (unchanged)", got)
+	}
+}
+
+func TestChmodServer_NotFound(t *testing.T) {
+	c, _ := newTestClient(t)
+	err := c.ChmodServer("nonexistent", 0o755)
+	if err == nil {
+		t.Fatal("expected error for nonexistent server")
+	}
+	if !strings.Contains(err.Error(), "server not found") {
+		t.Errorf("error = %q, want 'server not found'", err.Error())
+	}
+}
+
+func TestChmodServer_PathTraversal(t *testing.T) {
+	c, _ := newTestClient(t)
+	err := c.ChmodServer("../escape", 0o755)
+	if err != ErrPathTraversal {
+		t.Errorf("expected ErrPathTraversal, got %v", err)
+	}
+}
+
 // --- Migrate ---
 
 func TestMigrate(t *testing.T) {
