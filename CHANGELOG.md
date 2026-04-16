@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `update` stanza with `auto_revert` in Nomad job spec
+- `force_pull = true` in Nomad Docker config
+
+### Changed
+- Build output now goes to `bin/` directory instead of project root
+- `make clean` removes `bin/` directory instead of a bare binary
+- `.gitignore` uses `/bin/` pattern instead of bare binary name, and adds `.env.*`
+- Registry hostname in deploy spec and CLAUDE.md replaced with `gitea.example.com` placeholder
+
 ## [v1.1.0] - 2026-04-16
 
 ### Added

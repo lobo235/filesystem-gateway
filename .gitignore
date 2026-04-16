@@ -1,8 +1,9 @@
 # Secrets
 .env
+.env.*
 
 # Build output
-filesystem-gateway
+/bin/
 /dist/
 
 # Go
