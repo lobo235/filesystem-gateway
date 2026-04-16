@@ -3,6 +3,14 @@ job "filesystem-gateway" {
   datacenters = ["dc1"]
   type        = "service"
 
+  update {
+    max_parallel     = 1
+    health_check     = "checks"
+    min_healthy_time = "15s"
+    healthy_deadline = "5m"
+    auto_revert      = true
+  }
+
   group "filesystem-gateway" {
     count = 1
 
@@ -53,8 +61,9 @@ job "filesystem-gateway" {
       driver = "docker"
 
       config {
-        image = "gitea.big.netlobo.com/netlobo/filesystem-gateway:latest"
-        ports = ["http"]
+        image      = "gitea.example.com/netlobo/filesystem-gateway:latest"
+        force_pull = true
+        ports      = ["http"]
         volumes = [
           "/path/to/data:/mnt/data",
           "/path/to/status:/data",
@@ -78,12 +87,12 @@ EOF
         DATA_DIR      = "/data"
       }
 
-
       template {
         data        = "{{ with nomadVar \"nomad/jobs/filesystem-gateway\" }}{{ .image_digest }}{{ end }}"
         destination = "local/deploy-trigger"
         change_mode = "restart"
       }
+
       resources {
         cpu    = 200
         memory = 128
