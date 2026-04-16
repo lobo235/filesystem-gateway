@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.1.1] - 2026-04-16
+
 ### Added
 - `update` stanza with `auto_revert` in Nomad job spec
 - `force_pull = true` in Nomad Docker config
