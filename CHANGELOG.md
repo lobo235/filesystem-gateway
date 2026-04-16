@@ -7,15 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `update` stanza with `auto_revert` in Nomad job spec
+- `force_pull = true` in Nomad Docker config
+
 ### Changed
-- Gitea Docker workflow: add Buildx setup and registry layer caching, gate build on lint+test job
-- GitHub workflows: consolidate ci.yml and docker.yml into single ci.yml with Docker job gated on test job
-- Nomad job spec: add `update` stanza with auto_revert, add `force_pull = true` to Docker config
-- Makefile: build output now goes to `bin/` directory instead of project root
-- .gitignore: use `/bin/` pattern instead of bare binary name, add `.env.*` pattern
+- Build output now goes to `bin/` directory instead of project root
+- `make clean` removes `bin/` directory instead of a bare binary
+- `.gitignore` uses `/bin/` pattern instead of bare binary name, and adds `.env.*`
+- Registry hostname in deploy spec and CLAUDE.md replaced with `gitea.example.com` placeholder
+
+## [v1.0.1] - 2026-04-07
 
 ### Fixed
-- Replace real infrastructure hostname with `gitea.example.com` placeholder in workflows, deploy spec, and docs
 - Server name validation now accepts one level of subdirectory nesting (e.g., `minecraft/atm9`) — previously rejected names with `/`, breaking all Minecraft server creation via the MCP server which sends `minecraft/<name>` paths
 
 ## [v1.0.0] - 2026-03-28

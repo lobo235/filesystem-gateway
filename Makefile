@@ -28,7 +28,7 @@ hooks:
 	git config core.hooksPath .githooks
 
 clean:
-	rm -f $(BINARY) coverage.out
+	rm -rf bin/ coverage.out
 
 deploy:
 	@set -a && . $(ENV_FILE) && set +a && \
