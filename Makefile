@@ -8,7 +8,8 @@ ENV_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../.env
 .PHONY: build test cover lint run clean hooks deploy
 
 build:
-	go build -trimpath $(LDFLAGS) -o $(BINARY) ./cmd/server
+	@mkdir -p bin
+	go build -trimpath $(LDFLAGS) -o bin/$(BINARY) ./cmd/server
 
 test:
 	go test ./...
