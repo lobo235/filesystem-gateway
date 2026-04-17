@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.1.2] - 2026-04-16
+
+### Changed
+- Consolidated `.gitea/workflows/docker.yml` into a single `ci.yml` with lint, test, build, and docker jobs. The docker push is now gated behind lint+test+build passing, so broken code cannot reach the registry or Nomad.
+- Pin `golangci-lint` version in `.golangci-version` file (`v2.11.3`) as the single source of truth for local and CI. The Makefile's `lint` target installs the pinned version into `./bin/` via the official `install.sh` script, and the CI workflow calls `make lint` rather than duplicating install logic.
+- Docker build now uses Buildx with registry layer caching (`:buildcache` tag, `mode=max`) for faster rebuilds.
+- Makefile `test` and `cover` targets now pass `-race`.
+
 ## [v1.1.1] - 2026-04-16
 
 ### Added
