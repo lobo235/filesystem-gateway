@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/lobo235/filesystem-gateway/internal/nfs"
 )
@@ -696,5 +697,157 @@ func (s *Server) deleteFileHandler() http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
+// --- Read-only listing and file reads ---
+
+const (
+	lsDefaultMaxEntries = 1000
+	lsHardMaxEntries    = 10000
+	readDefaultMaxBytes = 1 << 20        // 1 MiB
+	readHardMaxBytes    = 10 * (1 << 20) // 10 MiB
+)
+
+// lsHandler handles GET /servers/{name}/ls.
+func (s *Server) lsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !validServerName(name) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
+			return
+		}
+
+		q := r.URL.Query()
+		subPath := q.Get("path")
+
+		recursive := false
+		if v := q.Get("recursive"); v != "" {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_body", "recursive must be a boolean")
+				return
+			}
+			recursive = parsed
+		}
+
+		maxEntries := lsDefaultMaxEntries
+		if v := q.Get("max_entries"); v != "" {
+			parsed, err := strconv.Atoi(v)
+			if err != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid_body", "max_entries must be a positive integer")
+				return
+			}
+			maxEntries = parsed
+		}
+		if maxEntries > lsHardMaxEntries {
+			maxEntries = lsHardMaxEntries
+		}
+
+		entries, truncated, err := s.nfs.ListDir(name, subPath, recursive, maxEntries)
+		if err != nil {
+			if errors.Is(err, nfs.ErrPathTraversal) {
+				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
+				return
+			}
+			if strings.Contains(err.Error(), "server not found") {
+				writeError(w, http.StatusNotFound, "server_not_found", err.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "path not found") {
+				writeError(w, http.StatusNotFound, "path_not_found", err.Error())
+				return
+			}
+			s.log.Error("list dir failed", "error", err, "server", name, "trace_id", traceIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to list directory")
+			return
+		}
+		if entries == nil {
+			entries = []nfs.DirEntry{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "truncated": truncated})
+	}
+}
+
+// readHandler handles GET /servers/{name}/read.
+func (s *Server) readHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !validServerName(name) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
+			return
+		}
+
+		q := r.URL.Query()
+		subPath := q.Get("path")
+		if subPath == "" {
+			writeError(w, http.StatusBadRequest, "missing_fields", "path query parameter is required")
+			return
+		}
+
+		maxBytes := int64(readDefaultMaxBytes)
+		if v := q.Get("max_bytes"); v != "" {
+			parsed, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid_body", "max_bytes must be a positive integer")
+				return
+			}
+			if parsed > readHardMaxBytes {
+				writeError(w, http.StatusRequestEntityTooLarge, "max_bytes_exceeded", "max_bytes exceeds hard cap of 10485760 bytes (10 MiB)")
+				return
+			}
+			maxBytes = parsed
+		}
+
+		origin := q.Get("origin")
+		if origin == "" {
+			origin = "start"
+		}
+		var originEnd bool
+		switch origin {
+		case "start":
+			originEnd = false
+		case "end":
+			originEnd = true
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_body", "origin must be 'start' or 'end'")
+			return
+		}
+
+		data, truncated, err := s.nfs.ReadFileEx(name, subPath, maxBytes, originEnd)
+		if err != nil {
+			if errors.Is(err, nfs.ErrPathTraversal) {
+				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
+				return
+			}
+			if errors.Is(err, nfs.ErrNotRegularFile) {
+				writeError(w, http.StatusUnsupportedMediaType, "not_regular_file", "target is not a regular file (device, socket, or named pipe)")
+				return
+			}
+			if errors.Is(err, nfs.ErrFileNotFound) {
+				writeError(w, http.StatusNotFound, "file_not_found", "file not found")
+				return
+			}
+			if strings.Contains(err.Error(), "server not found") {
+				writeError(w, http.StatusNotFound, "server_not_found", err.Error())
+				return
+			}
+			s.log.Error("read file failed", "error", err, "server", name, "trace_id", traceIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to read file")
+			return
+		}
+
+		contentType := "application/octet-stream"
+		if utf8.Valid(data) {
+			contentType = "text/plain; charset=utf-8"
+		}
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		if truncated {
+			w.Header().Set("X-Truncated", "true")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
 	}
 }

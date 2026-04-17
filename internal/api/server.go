@@ -64,6 +64,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /servers/{name}/files/move", auth(http.HandlerFunc(s.moveFileHandler())))
 	mux.Handle("DELETE /servers/{name}/files/delete", auth(http.HandlerFunc(s.deleteFileHandler())))
 
+	// Read-only listing and raw file reads (for MCP operator inspection).
+	mux.Handle("GET /servers/{name}/ls", auth(http.HandlerFunc(s.lsHandler())))
+	mux.Handle("GET /servers/{name}/read", auth(http.HandlerFunc(s.readHandler())))
+
 	// Backup operations.
 	mux.Handle("GET /servers/{name}/backups", auth(http.HandlerFunc(s.listBackupsHandler())))
 	mux.Handle("POST /servers/{name}/backups", auth(http.HandlerFunc(s.startBackupHandler())))

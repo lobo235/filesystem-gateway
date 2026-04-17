@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -82,6 +83,17 @@ type Client interface {
 	MoveFile(serverName, srcPath, dstPath string, uid, gid int) error
 	// MaxWriteFileSize returns the configured maximum write file size.
 	MaxWriteFileSize() int64
+	// ListDir enumerates entries under subPath within a server's directory.
+	// When recursive is true, walks the subtree. Stops once maxEntries is reached
+	// and reports truncated=true if more entries exist. Symlinks are not followed.
+	// Returns a "server not found" error if the server directory is missing, or a
+	// "path not found" error if subPath itself does not exist.
+	ListDir(serverName, subPath string, recursive bool, maxEntries int) ([]DirEntry, bool, error)
+	// ReadFileEx reads up to maxBytes of a regular file. When originEnd is true,
+	// reads the last maxBytes. Returns truncated=true when the file's size
+	// exceeds maxBytes. Rejects non-regular files with ErrNotRegularFile and
+	// missing files with a "file not found" error.
+	ReadFileEx(serverName, subPath string, maxBytes int64, originEnd bool) ([]byte, bool, error)
 }
 
 // ServerInfo describes a single server directory's metadata as returned by StatServer.
@@ -175,6 +187,21 @@ type ArchiveEntry struct {
 	Size  int64  `json:"size"`
 	IsDir bool   `json:"is_dir"`
 }
+
+// DirEntry describes a filesystem entry returned by ListDir.
+type DirEntry struct {
+	Path    string `json:"path"`
+	Type    string `json:"type"` // "file" or "dir"
+	Size    int64  `json:"size"`
+	ModTime string `json:"mtime"`
+}
+
+// ErrNotRegularFile is returned when a read target is a device, socket,
+// named pipe, or other non-regular file.
+var ErrNotRegularFile = fmt.Errorf("not a regular file")
+
+// ErrFileNotFound is returned when a file or directory does not exist.
+var ErrFileNotFound = fmt.Errorf("file not found")
 
 // safeIDRegex validates IDs to prevent path traversal. Accepts timestamps (2026-03-22T10-05-00) and UUIDs.
 var backupIDRegex = regexp.MustCompile(`^[0-9a-fA-FT-]+$`)
@@ -423,6 +450,218 @@ func (c *client) ReadFile(serverName, subPath string) ([]byte, error) {
 		return nil, fmt.Errorf("read file: %w", err)
 	}
 	return data, nil
+}
+
+// serverScopedPath resolves subPath under serverName and enforces that the
+// resolved location stays within that server's directory (stricter than the
+// basePath-level check in SafePath).
+func (c *client) serverScopedPath(serverName, subPath string) (string, error) {
+	serverRoot, err := c.SafePath(serverName)
+	if err != nil {
+		return "", err
+	}
+	target, err := c.SafePath(serverName, subPath)
+	if err != nil {
+		return "", err
+	}
+	if target != serverRoot && !strings.HasPrefix(target, serverRoot+string(filepath.Separator)) {
+		return "", ErrPathTraversal
+	}
+	return target, nil
+}
+
+// ListDir enumerates entries under subPath within a server's directory.
+func (c *client) ListDir(serverName, subPath string, recursive bool, maxEntries int) ([]DirEntry, bool, error) {
+	serverRoot, err := c.SafePath(serverName)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := os.Stat(serverRoot); os.IsNotExist(err) {
+		return nil, false, fmt.Errorf("server not found: %s", serverName)
+	}
+	target, err := c.serverScopedPath(serverName, subPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := checkIsDir(target, subPath); err != nil {
+		return nil, false, err
+	}
+	if maxEntries <= 0 {
+		maxEntries = 1000
+	}
+	if recursive {
+		return walkDirTree(serverRoot, target, maxEntries)
+	}
+	return listDirFlat(serverRoot, target, maxEntries)
+}
+
+// checkIsDir returns an error if target does not exist or is not a directory.
+// The subPath is used in error messages to identify the offending path.
+func checkIsDir(target, subPath string) error {
+	info, err := os.Stat(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("path not found: %s", subPath)
+		}
+		return fmt.Errorf("stat path: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path not found: %s", subPath)
+	}
+	return nil
+}
+
+// appendDirEntry adds an entry to entries unless maxEntries has been reached.
+// Returns (updatedEntries, truncated, keepGoing).
+func appendDirEntry(entries []DirEntry, maxEntries int, serverRoot, abs string, fi os.FileInfo) ([]DirEntry, bool, bool) {
+	if len(entries) >= maxEntries {
+		return entries, true, false
+	}
+	rel, err := filepath.Rel(serverRoot, abs)
+	if err != nil {
+		return entries, false, true
+	}
+	t := "file"
+	if fi.IsDir() {
+		t = "dir"
+	}
+	return append(entries, DirEntry{
+		Path:    filepath.ToSlash(rel),
+		Type:    t,
+		Size:    fi.Size(),
+		ModTime: fi.ModTime().UTC().Format(time.RFC3339),
+	}), false, true
+}
+
+// listableEntry reports whether fi should appear in a listing (regular file
+// or directory, but not a symlink or other special file).
+func listableEntry(fi os.FileInfo) bool {
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	return fi.Mode().IsRegular() || fi.IsDir()
+}
+
+func listDirFlat(serverRoot, target string, maxEntries int) ([]DirEntry, bool, error) {
+	dirEntries, err := os.ReadDir(target)
+	if err != nil {
+		return nil, false, fmt.Errorf("list files: %w", err)
+	}
+	entries := make([]DirEntry, 0)
+	truncated := false
+	for _, e := range dirEntries {
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if !listableEntry(fi) {
+			continue
+		}
+		var keep bool
+		entries, truncated, keep = appendDirEntry(entries, maxEntries, serverRoot, filepath.Join(target, e.Name()), fi)
+		if !keep {
+			break
+		}
+	}
+	return entries, truncated, nil
+}
+
+func walkDirTree(serverRoot, target string, maxEntries int) ([]DirEntry, bool, error) {
+	entries := make([]DirEntry, 0)
+	truncated := false
+	walkErr := filepath.WalkDir(target, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if path == target {
+				return err
+			}
+			return nil
+		}
+		if path == target {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !fi.Mode().IsRegular() && !fi.IsDir() {
+			return nil
+		}
+		var keep bool
+		entries, truncated, keep = appendDirEntry(entries, maxEntries, serverRoot, path, fi)
+		if !keep {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, filepath.SkipAll) {
+		return nil, false, fmt.Errorf("walk dir: %w", walkErr)
+	}
+	return entries, truncated, nil
+}
+
+// ReadFileEx reads up to maxBytes of a regular file. When originEnd is true,
+// returns the last maxBytes of the file for log-tailing. Rejects non-regular
+// files with ErrNotRegularFile and missing files with ErrFileNotFound.
+func (c *client) ReadFileEx(serverName, subPath string, maxBytes int64, originEnd bool) ([]byte, bool, error) {
+	serverRoot, err := c.SafePath(serverName)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := os.Stat(serverRoot); os.IsNotExist(err) {
+		return nil, false, fmt.Errorf("server not found: %s", serverName)
+	}
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+	filePath, err := c.serverScopedPath(serverName, subPath)
+	if err != nil {
+		return nil, false, err
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, ErrFileNotFound
+		}
+		return nil, false, fmt.Errorf("stat file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, ErrNotRegularFile
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, ErrFileNotFound
+		}
+		return nil, false, fmt.Errorf("open file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	size := info.Size()
+	truncated := size > maxBytes
+	readBytes := maxBytes
+	if size < readBytes {
+		readBytes = size
+	}
+
+	if originEnd && truncated {
+		if _, err := f.Seek(size-readBytes, io.SeekStart); err != nil {
+			return nil, false, fmt.Errorf("seek file: %w", err)
+		}
+	}
+
+	buf := make([]byte, readBytes)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return nil, false, fmt.Errorf("read file: %w", err)
+	}
+	return buf[:n], truncated, nil
 }
 
 // GrepFiles runs grep on a path within a server directory.

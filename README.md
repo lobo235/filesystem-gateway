@@ -36,11 +36,13 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 | GET | `/servers/{name}/archive-contents` | List archive entries |
 | GET | `/servers/{name}/disk-usage` | Disk usage in bytes |
 | GET | `/servers/{name}/files` | List files |
-| GET | `/servers/{name}/files/read` | Read file contents |
+| GET | `/servers/{name}/files/read` | Read file contents (JSON) |
 | GET | `/servers/{name}/files/grep` | Grep files |
 | POST | `/servers/{name}/files/write` | Write file |
 | POST | `/servers/{name}/files/move` | Move/rename file |
 | DELETE | `/servers/{name}/files/delete` | Delete file or directory |
+| GET | `/servers/{name}/ls` | List entries (`?path=&recursive=&max_entries=`); returns `{entries,truncated}` |
+| GET | `/servers/{name}/read` | Read file as raw bytes (`?path=&max_bytes=&origin=start\|end`); 10 MiB hard cap |
 | GET | `/servers/{name}/backups` | List backups |
 | POST | `/servers/{name}/backups` | Start async backup |
 | GET | `/servers/{name}/backups/{backupID}` | Backup status |

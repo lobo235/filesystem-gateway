@@ -47,6 +47,12 @@ type mockNFS struct {
 	archiveErr       error
 	writeFileErr     error
 	moveFileErr      error
+	dirEntries       []nfs.DirEntry
+	dirTruncated     bool
+	listDirErr       error
+	readFileExData   []byte
+	readFileExTrunc  bool
+	readFileExErr    error
 }
 
 func (m *mockNFS) SafePath(parts ...string) (string, error) { return "", nil }
@@ -88,6 +94,12 @@ func (m *mockNFS) MoveFile(string, string, string, int, int) error {
 	return m.moveFileErr
 }
 func (m *mockNFS) MaxWriteFileSize() int64 { return 1048576 }
+func (m *mockNFS) ListDir(string, string, bool, int) ([]nfs.DirEntry, bool, error) {
+	return m.dirEntries, m.dirTruncated, m.listDirErr
+}
+func (m *mockNFS) ReadFileEx(string, string, int64, bool) ([]byte, bool, error) {
+	return m.readFileExData, m.readFileExTrunc, m.readFileExErr
+}
 
 // --- Helpers ---
 
@@ -611,5 +623,214 @@ func TestCreateServer_InternalError(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", rr.Code)
+	}
+}
+
+// --- Ls handler ---
+
+func TestLs_Success(t *testing.T) {
+	s := newTestServer(&mockNFS{
+		dirEntries: []nfs.DirEntry{
+			{Path: "logs/latest.log", Type: "file", Size: 123, ModTime: "2026-04-16T00:00:00Z"},
+		},
+		dirTruncated: false,
+	})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		Entries   []nfs.DirEntry `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Entries) != 1 || resp.Entries[0].Path != "logs/latest.log" {
+		t.Errorf("unexpected entries: %+v", resp.Entries)
+	}
+	if resp.Truncated {
+		t.Error("expected truncated=false")
+	}
+}
+
+func TestLs_Truncated(t *testing.T) {
+	s := newTestServer(&mockNFS{dirEntries: []nfs.DirEntry{{Path: "a", Type: "file"}}, dirTruncated: true})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls?max_entries=1", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		Truncated bool `json:"truncated"`
+	}
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if !resp.Truncated {
+		t.Error("expected truncated=true")
+	}
+}
+
+func TestLs_PathTraversal(t *testing.T) {
+	s := newTestServer(&mockNFS{listDirErr: nfs.ErrPathTraversal})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls?path=..", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestLs_ServerNotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{listDirErr: fmt.Errorf("server not found: mc")})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "server_not_found" {
+		t.Errorf("code = %q, want server_not_found", resp.Code)
+	}
+}
+
+func TestLs_PathNotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{listDirErr: fmt.Errorf("path not found: logs")})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls?path=logs", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "path_not_found" {
+		t.Errorf("code = %q, want path_not_found", resp.Code)
+	}
+}
+
+func TestLs_InvalidRecursive(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls?recursive=maybe", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestLs_InvalidMaxEntries(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/ls?max_entries=0", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// --- Read handler ---
+
+func TestRead_Success_Text(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExData: []byte("hello world")})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=hello.txt", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := rr.Header().Get("Content-Length"); got != "11" {
+		t.Errorf("Content-Length = %q, want 11", got)
+	}
+	if rr.Body.String() != "hello world" {
+		t.Errorf("body = %q, want 'hello world'", rr.Body.String())
+	}
+	if rr.Header().Get("X-Truncated") != "" {
+		t.Errorf("X-Truncated should be empty, got %q", rr.Header().Get("X-Truncated"))
+	}
+}
+
+func TestRead_Success_Binary(t *testing.T) {
+	// Invalid UTF-8 sequence (0xff is not a valid UTF-8 byte).
+	s := newTestServer(&mockNFS{readFileExData: []byte{0xff, 0xfe, 0xfd}})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=x.bin", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", got)
+	}
+}
+
+func TestRead_Truncated(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExData: []byte("partial"), readFileExTrunc: true})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=big.log&max_bytes=7", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if rr.Header().Get("X-Truncated") != "true" {
+		t.Errorf("X-Truncated = %q, want true", rr.Header().Get("X-Truncated"))
+	}
+}
+
+func TestRead_MissingPath(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestRead_MaxBytesExceedsHardCap(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=x&max_bytes=20971520", nil)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rr.Code)
+	}
+}
+
+func TestRead_InvalidOrigin(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=x&origin=middle", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestRead_PathTraversal(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExErr: nfs.ErrPathTraversal})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=../../etc/passwd", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestRead_NotRegularFile(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExErr: nfs.ErrNotRegularFile})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=pipe", nil)
+	if rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "not_regular_file" {
+		t.Errorf("code = %q, want not_regular_file", resp.Code)
+	}
+}
+
+func TestRead_FileNotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExErr: nfs.ErrFileNotFound})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=missing", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "file_not_found" {
+		t.Errorf("code = %q, want file_not_found", resp.Code)
+	}
+}
+
+func TestRead_ServerNotFound(t *testing.T) {
+	s := newTestServer(&mockNFS{readFileExErr: fmt.Errorf("server not found: mc")})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc/read?path=x", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	var resp errorResponse
+	json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Code != "server_not_found" {
+		t.Errorf("code = %q, want server_not_found", resp.Code)
 	}
 }

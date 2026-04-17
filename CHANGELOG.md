@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.2.0] - 2026-04-16
+
+### Added
+- `GET /servers/{name}/ls` — list entries under a server directory. Query params: `path` (relative, default root), `recursive` (bool, default false), `max_entries` (default 1000, hard cap 10000). Returns `{"entries":[{"path","type","size","mtime"}], "truncated":bool}`. Symlinks are not followed and not reported.
+- `GET /servers/{name}/read` — read a file as raw bytes. Query params: `path` (required), `max_bytes` (default 1 MiB, hard cap 10 MiB — exceeding returns 413), `origin` (`start`|`end`, default `start`; `end` returns the last `max_bytes` for log tailing). Response body is the file content; Content-Type is sniffed (`text/plain; charset=utf-8` when UTF-8 validates, else `application/octet-stream`). Sets `Content-Length` and `X-Truncated: true` when the file exceeds `max_bytes`. Returns 415 for non-regular files (device/socket/FIFO).
+- Per-server path scoping for the new endpoints: after symlink resolution the target must stay inside the specific server's directory, stricter than the existing basePath-level check.
+
 ## [v1.1.2] - 2026-04-16
 
 ### Changed

@@ -134,11 +134,13 @@ All routes except `/health` require `Authorization: Bearer <GATEWAY_API_KEY>`.
 | GET | `/servers/{name}/archive-contents` | Yes | List archive entries (`?path=mods.zip`) supports .zip, .tar.gz, .tar.zst |
 | GET | `/servers/{name}/disk-usage` | Yes | Disk usage in bytes |
 | GET | `/servers/{name}/files` | Yes | List files (`?path=subdir`) |
-| GET | `/servers/{name}/files/read` | Yes | Read file (`?path=logs/latest.log`) max 1MB |
+| GET | `/servers/{name}/files/read` | Yes | Read file as JSON `{"content": ...}` (`?path=logs/latest.log`) max 1MB |
 | GET | `/servers/{name}/files/grep` | Yes | Grep (`?path=...&pattern=...`) max 10k lines/5MB |
 | POST | `/servers/{name}/files/write` | Yes | Write file `{"path":"...","content":"...","uid":N,"gid":N}` max configurable (default 1MB) |
 | POST | `/servers/{name}/files/move` | Yes | Move/rename file `{"src_path":"...","dst_path":"...","uid":N,"gid":N}` |
 | DELETE | `/servers/{name}/files/delete` | Yes | Delete file or directory (`?path=...`) |
+| GET | `/servers/{name}/ls` | Yes | List entries (`?path=&recursive=bool&max_entries=N`); defaults 1000/cap 10000; returns `{entries:[{path,type,size,mtime}], truncated}`; symlinks are skipped |
+| GET | `/servers/{name}/read` | Yes | Read file as raw bytes (`?path=&max_bytes=N&origin=start\|end`); default 1 MiB / hard cap 10 MiB (413 if exceeded); sniffs Content-Type (`text/plain; charset=utf-8` when UTF-8 validates, else `application/octet-stream`); `X-Truncated: true` when file > max_bytes; 415 for device/socket/FIFO |
 | GET | `/servers/{name}/backups` | Yes | List available `.tar.zst` backups |
 | POST | `/servers/{name}/backups` | Yes | Trigger async backup `{"uid":N,"gid":N}` (optional); returns backup ID |
 | GET | `/servers/{name}/backups/{backupID}` | Yes | Backup status/details |

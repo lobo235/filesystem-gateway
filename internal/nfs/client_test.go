@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1530,5 +1532,309 @@ func TestWriteFile_OverwriteExisting(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(serverDir, "test.txt"))
 	if string(data) != "new" {
 		t.Errorf("content = %q, want 'new'", string(data))
+	}
+}
+
+// --- ListDir ---
+
+func TestListDir_NonRecursive(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(filepath.Join(serverDir, "logs"), 0755)
+	os.WriteFile(filepath.Join(serverDir, "server.properties"), []byte("a=1"), 0644)
+	os.WriteFile(filepath.Join(serverDir, "logs", "latest.log"), []byte("log"), 0644)
+
+	entries, truncated, err := c.ListDir("myserver", "", false, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Error("expected truncated=false")
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	// Non-recursive must not descend into logs/.
+	for _, e := range entries {
+		if strings.Contains(e.Path, "latest.log") {
+			t.Errorf("non-recursive should not include %s", e.Path)
+		}
+	}
+}
+
+func TestListDir_Recursive(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(filepath.Join(serverDir, "logs"), 0755)
+	os.MkdirAll(filepath.Join(serverDir, "world", "region"), 0755)
+	os.WriteFile(filepath.Join(serverDir, "server.properties"), []byte("a"), 0644)
+	os.WriteFile(filepath.Join(serverDir, "logs", "latest.log"), []byte("log"), 0644)
+	os.WriteFile(filepath.Join(serverDir, "world", "level.dat"), []byte("lvl"), 0644)
+	os.WriteFile(filepath.Join(serverDir, "world", "region", "r.0.0.mca"), []byte("mca"), 0644)
+
+	entries, truncated, err := c.ListDir("myserver", "", true, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Error("expected truncated=false")
+	}
+	// Expect: server.properties, logs, logs/latest.log, world, world/level.dat, world/region, world/region/r.0.0.mca = 7 entries.
+	if len(entries) != 7 {
+		t.Fatalf("expected 7 entries, got %d: %v", len(entries), entries)
+	}
+	found := map[string]bool{}
+	for _, e := range entries {
+		found[e.Path] = true
+	}
+	wantPaths := []string{"server.properties", "logs/latest.log", "world/level.dat", "world/region/r.0.0.mca"}
+	for _, p := range wantPaths {
+		if !found[p] {
+			t.Errorf("missing entry %s", p)
+		}
+	}
+}
+
+func TestListDir_Truncation(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	for i := 0; i < 10; i++ {
+		os.WriteFile(filepath.Join(serverDir, fmt.Sprintf("file-%02d.txt", i)), []byte("x"), 0644)
+	}
+
+	entries, truncated, err := c.ListDir("myserver", "", false, 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+	if len(entries) != 3 {
+		t.Errorf("expected 3 entries, got %d", len(entries))
+	}
+}
+
+func TestListDir_ServerNotFound(t *testing.T) {
+	c, _ := newTestClient(t)
+	_, _, err := c.ListDir("nonexistent", "", false, 100)
+	if err == nil {
+		t.Fatal("expected error for missing server")
+	}
+	if !strings.Contains(err.Error(), "server not found") {
+		t.Errorf("expected server-not-found error, got %v", err)
+	}
+}
+
+func TestListDir_PathNotFound(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver"), 0755)
+
+	_, _, err := c.ListDir("myserver", "missing-subdir", false, 100)
+	if err == nil {
+		t.Fatal("expected error for missing subpath")
+	}
+	if !strings.Contains(err.Error(), "path not found") {
+		t.Errorf("expected path-not-found error, got %v", err)
+	}
+}
+
+func TestListDir_PathTraversal(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver"), 0755)
+
+	_, _, err := c.ListDir("myserver", "../..", false, 100)
+	if !errors.Is(err, ErrPathTraversal) {
+		t.Errorf("expected ErrPathTraversal, got %v", err)
+	}
+}
+
+func TestListDir_SymlinkEscape(t *testing.T) {
+	c, base := newTestClient(t)
+	serverA := filepath.Join(base, "server-a")
+	serverB := filepath.Join(base, "server-b")
+	os.MkdirAll(serverA, 0755)
+	os.MkdirAll(serverB, 0755)
+	os.WriteFile(filepath.Join(serverB, "secret"), []byte("leak"), 0644)
+
+	// Symlink inside server-a pointing at server-b.
+	if err := os.Symlink(serverB, filepath.Join(serverA, "escape")); err != nil {
+		t.Skipf("symlink creation failed (may need root or fs support): %v", err)
+	}
+
+	_, _, err := c.ListDir("server-a", "escape", false, 100)
+	if !errors.Is(err, ErrPathTraversal) {
+		t.Errorf("expected ErrPathTraversal for symlink escape, got %v", err)
+	}
+}
+
+func TestListDir_SkipsSymlinks(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	os.WriteFile(filepath.Join(serverDir, "real.txt"), []byte("x"), 0644)
+	if err := os.Symlink(filepath.Join(serverDir, "real.txt"), filepath.Join(serverDir, "link.txt")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+
+	entries, _, err := c.ListDir("myserver", "", false, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, e := range entries {
+		if e.Path == "link.txt" {
+			t.Error("symlink should have been skipped from listing")
+		}
+	}
+}
+
+// --- ReadFileEx ---
+
+func TestReadFileEx_Start(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	os.WriteFile(filepath.Join(serverDir, "hello.txt"), []byte("hello world"), 0644)
+
+	data, truncated, err := c.ReadFileEx("myserver", "hello.txt", 1024, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Error("expected truncated=false")
+	}
+	if string(data) != "hello world" {
+		t.Errorf("got %q, want 'hello world'", string(data))
+	}
+}
+
+func TestReadFileEx_TruncatedStart(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	content := []byte("0123456789abcdef")
+	os.WriteFile(filepath.Join(serverDir, "data.bin"), content, 0644)
+
+	data, truncated, err := c.ReadFileEx("myserver", "data.bin", 5, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+	if string(data) != "01234" {
+		t.Errorf("got %q, want '01234'", string(data))
+	}
+}
+
+func TestReadFileEx_OriginEnd(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	content := []byte("0123456789abcdef")
+	os.WriteFile(filepath.Join(serverDir, "data.bin"), content, 0644)
+
+	data, truncated, err := c.ReadFileEx("myserver", "data.bin", 5, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !truncated {
+		t.Error("expected truncated=true")
+	}
+	if string(data) != "bcdef" {
+		t.Errorf("got %q, want 'bcdef' (last 5 bytes)", string(data))
+	}
+}
+
+func TestReadFileEx_OriginEnd_SmallFile(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	os.WriteFile(filepath.Join(serverDir, "tiny.txt"), []byte("hi"), 0644)
+
+	// origin=end with max_bytes larger than file: return whole file, no truncation.
+	data, truncated, err := c.ReadFileEx("myserver", "tiny.txt", 100, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Error("expected truncated=false")
+	}
+	if string(data) != "hi" {
+		t.Errorf("got %q, want 'hi'", string(data))
+	}
+}
+
+func TestReadFileEx_NotRegularFile_FIFO(t *testing.T) {
+	c, base := newTestClient(t)
+	serverDir := filepath.Join(base, "myserver")
+	os.MkdirAll(serverDir, 0755)
+	fifoPath := filepath.Join(serverDir, "pipe")
+	if err := syscall.Mkfifo(fifoPath, 0644); err != nil {
+		t.Skipf("mkfifo not supported here: %v", err)
+	}
+
+	_, _, err := c.ReadFileEx("myserver", "pipe", 1024, false)
+	if !errors.Is(err, ErrNotRegularFile) {
+		t.Errorf("expected ErrNotRegularFile for FIFO, got %v", err)
+	}
+}
+
+func TestReadFileEx_NotRegularFile_Directory(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver", "subdir"), 0755)
+
+	_, _, err := c.ReadFileEx("myserver", "subdir", 1024, false)
+	if !errors.Is(err, ErrNotRegularFile) {
+		t.Errorf("expected ErrNotRegularFile for directory, got %v", err)
+	}
+}
+
+func TestReadFileEx_FileNotFound(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver"), 0755)
+
+	_, _, err := c.ReadFileEx("myserver", "missing.txt", 1024, false)
+	if !errors.Is(err, ErrFileNotFound) {
+		t.Errorf("expected ErrFileNotFound, got %v", err)
+	}
+}
+
+func TestReadFileEx_ServerNotFound(t *testing.T) {
+	c, _ := newTestClient(t)
+	_, _, err := c.ReadFileEx("nonexistent", "foo.txt", 1024, false)
+	if err == nil {
+		t.Fatal("expected error for missing server")
+	}
+	if !strings.Contains(err.Error(), "server not found") {
+		t.Errorf("expected server-not-found error, got %v", err)
+	}
+}
+
+func TestReadFileEx_PathTraversal(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver"), 0755)
+
+	_, _, err := c.ReadFileEx("myserver", "../../etc/passwd", 1024, false)
+	if !errors.Is(err, ErrPathTraversal) {
+		t.Errorf("expected ErrPathTraversal, got %v", err)
+	}
+}
+
+func TestReadFileEx_SymlinkEscape(t *testing.T) {
+	c, base := newTestClient(t)
+	serverA := filepath.Join(base, "server-a")
+	serverB := filepath.Join(base, "server-b")
+	os.MkdirAll(serverA, 0755)
+	os.MkdirAll(serverB, 0755)
+	os.WriteFile(filepath.Join(serverB, "secret"), []byte("leak"), 0644)
+
+	if err := os.Symlink(filepath.Join(serverB, "secret"), filepath.Join(serverA, "link")); err != nil {
+		t.Skipf("symlink creation failed: %v", err)
+	}
+
+	_, _, err := c.ReadFileEx("server-a", "link", 1024, false)
+	if !errors.Is(err, ErrPathTraversal) {
+		t.Errorf("expected ErrPathTraversal for symlink escape, got %v", err)
 	}
 }
