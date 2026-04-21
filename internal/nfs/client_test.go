@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -522,7 +523,7 @@ func TestGrepFiles_Match(t *testing.T) {
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(filepath.Join(dir, "server.log"), []byte("ERROR something broke\nINFO all good\nERROR again"), 0644)
 
-	result, err := c.GrepFiles("myserver", "", "ERROR")
+	result, err := c.GrepFiles("myserver", "", "ERROR", GrepOpts{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -532,6 +533,24 @@ func TestGrepFiles_Match(t *testing.T) {
 	if result.Truncated {
 		t.Error("should not be truncated")
 	}
+	if len(result.Matches) != 2 {
+		t.Fatalf("matches len = %d, want 2", len(result.Matches))
+	}
+	// Path must be server-root-relative, not absolute.
+	for _, m := range result.Matches {
+		if filepath.IsAbs(m.Path) {
+			t.Errorf("match path %q is absolute; expected server-relative", m.Path)
+		}
+		if m.Path != "server.log" {
+			t.Errorf("match path = %q, want %q", m.Path, "server.log")
+		}
+		if m.Line < 1 {
+			t.Errorf("line = %d, want >= 1", m.Line)
+		}
+		if !strings.Contains(m.Text, "ERROR") {
+			t.Errorf("text = %q, want it to contain ERROR", m.Text)
+		}
+	}
 }
 
 func TestGrepFiles_NoMatch(t *testing.T) {
@@ -540,12 +559,15 @@ func TestGrepFiles_NoMatch(t *testing.T) {
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(filepath.Join(dir, "server.log"), []byte("INFO all good\nDEBUG details"), 0644)
 
-	result, err := c.GrepFiles("myserver", "", "ERROR")
+	result, err := c.GrepFiles("myserver", "", "ERROR", GrepOpts{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.Count != 0 {
 		t.Errorf("count = %d, want 0", result.Count)
+	}
+	if result.Matches == nil {
+		t.Error("Matches should be non-nil empty slice, got nil")
 	}
 }
 
@@ -555,20 +577,295 @@ func TestGrepFiles_SubPath(t *testing.T) {
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(filepath.Join(dir, "latest.log"), []byte("ERROR something broke\nINFO fine"), 0644)
 
-	result, err := c.GrepFiles("myserver", "logs", "ERROR")
+	result, err := c.GrepFiles("myserver", "logs", "ERROR", GrepOpts{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.Count != 1 {
 		t.Errorf("count = %d, want 1", result.Count)
 	}
+	if result.Matches[0].Path != filepath.Join("logs", "latest.log") {
+		t.Errorf("match path = %q, want %q", result.Matches[0].Path, filepath.Join("logs", "latest.log"))
+	}
 }
 
 func TestGrepFiles_PathTraversal(t *testing.T) {
 	c, _ := newTestClient(t)
-	_, err := c.GrepFiles("..", "", "ERROR")
+	_, err := c.GrepFiles("..", "", "ERROR", GrepOpts{})
 	if err != ErrPathTraversal {
 		t.Errorf("expected ErrPathTraversal, got %v", err)
+	}
+}
+
+func TestGrepFiles_CaseInsensitive(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver")
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "mixed.log"), []byte("error lowercase\nERROR uppercase\nErRoR mixed"), 0644)
+
+	// Case sensitive baseline — only the uppercase line.
+	sensitive, err := c.GrepFiles("myserver", "", "ERROR", GrepOpts{})
+	if err != nil {
+		t.Fatalf("case-sensitive: %v", err)
+	}
+	if sensitive.Count != 1 {
+		t.Errorf("case-sensitive count = %d, want 1", sensitive.Count)
+	}
+
+	insensitive, err := c.GrepFiles("myserver", "", "ERROR", GrepOpts{CaseInsensitive: true})
+	if err != nil {
+		t.Fatalf("case-insensitive: %v", err)
+	}
+	if insensitive.Count != 3 {
+		t.Errorf("case-insensitive count = %d, want 3", insensitive.Count)
+	}
+}
+
+func TestGrepFiles_SkipExts(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver", "config")
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "app.log"), []byte("API_KEY=public-logs-value"), 0644)
+	os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=do-not-leak"), 0644)
+
+	// Without SkipExts both files should match.
+	bare, err := c.GrepFiles("myserver", "", "API_KEY", GrepOpts{})
+	if err != nil {
+		t.Fatalf("bare: %v", err)
+	}
+	if bare.Count != 2 {
+		t.Errorf("bare count = %d, want 2", bare.Count)
+	}
+
+	// With SkipExts=".env" the .env hit must not appear.
+	filtered, err := c.GrepFiles("myserver", "", "API_KEY", GrepOpts{SkipExts: []string{".env"}})
+	if err != nil {
+		t.Fatalf("filtered: %v", err)
+	}
+	if filtered.Count != 1 {
+		t.Errorf("filtered count = %d, want 1", filtered.Count)
+	}
+	for _, m := range filtered.Matches {
+		if strings.HasSuffix(m.Path, ".env") {
+			t.Errorf("match %+v slipped past SkipExts", m)
+		}
+		if strings.Contains(m.Text, "do-not-leak") {
+			t.Errorf("secret value leaked in text %q", m.Text)
+		}
+	}
+
+	// "env" without leading dot behaves identically.
+	alt, err := c.GrepFiles("myserver", "", "API_KEY", GrepOpts{SkipExts: []string{"env"}})
+	if err != nil {
+		t.Fatalf("alt: %v", err)
+	}
+	if alt.Count != 1 {
+		t.Errorf("alt count = %d, want 1", alt.Count)
+	}
+}
+
+func TestGrepFiles_ColonInFilename(t *testing.T) {
+	// File names on Linux can contain colons. The old flat "file:line:text"
+	// response shape could not be parsed unambiguously; with -Z we emit
+	// FILENAME\0LINE:TEXT, so this case must parse cleanly.
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver")
+	os.MkdirAll(dir, 0755)
+	weirdName := "odd:name.log"
+	os.WriteFile(filepath.Join(dir, weirdName), []byte("target line\n"), 0644)
+
+	result, err := c.GrepFiles("myserver", "", "target", GrepOpts{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("count = %d, want 1", result.Count)
+	}
+	m := result.Matches[0]
+	if m.Path != weirdName {
+		t.Errorf("path = %q, want %q", m.Path, weirdName)
+	}
+	if m.Line != 1 {
+		t.Errorf("line = %d, want 1", m.Line)
+	}
+	if m.Text != "target line" {
+		t.Errorf("text = %q, want %q", m.Text, "target line")
+	}
+}
+
+// --- FindFiles ---
+
+func TestFindFiles_NameGlob(t *testing.T) {
+	c, base := newTestClient(t)
+	dir := filepath.Join(base, "myserver", "data")
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "2026-04-19.csv"), []byte("a"), 0644)
+	os.WriteFile(filepath.Join(dir, "2026-04-20.csv"), []byte("b"), 0644)
+	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("c"), 0644)
+
+	result, err := c.FindFiles("myserver", "", FindOpts{NameGlob: "*.csv", Type: "f"})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(result.Entries))
+	}
+	for _, e := range result.Entries {
+		if !strings.HasSuffix(e.Path, ".csv") {
+			t.Errorf("non-csv %q slipped through glob", e.Path)
+		}
+		if e.Type != "file" {
+			t.Errorf("type = %q, want file", e.Type)
+		}
+	}
+}
+
+func TestFindFiles_TypeFilter(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(filepath.Join(root, "a"), 0755)
+	os.MkdirAll(filepath.Join(root, "b"), 0755)
+	os.WriteFile(filepath.Join(root, "file.txt"), []byte("x"), 0644)
+
+	filesOnly, err := c.FindFiles("myserver", "", FindOpts{Type: "f"})
+	if err != nil {
+		t.Fatalf("files: %v", err)
+	}
+	for _, e := range filesOnly.Entries {
+		if e.Type != "file" {
+			t.Errorf("type=f returned %q", e.Type)
+		}
+	}
+
+	dirsOnly, err := c.FindFiles("myserver", "", FindOpts{Type: "d"})
+	if err != nil {
+		t.Fatalf("dirs: %v", err)
+	}
+	for _, e := range dirsOnly.Entries {
+		if e.Type != "dir" {
+			t.Errorf("type=d returned %q", e.Type)
+		}
+	}
+}
+
+func TestFindFiles_MaxDepth(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(filepath.Join(root, "level1", "level2", "level3"), 0755)
+	os.WriteFile(filepath.Join(root, "root.txt"), []byte("0"), 0644)
+	os.WriteFile(filepath.Join(root, "level1", "one.txt"), []byte("1"), 0644)
+	os.WriteFile(filepath.Join(root, "level1", "level2", "two.txt"), []byte("2"), 0644)
+
+	result, err := c.FindFiles("myserver", "", FindOpts{MaxDepth: 1, Type: "f"})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	// depth 0: no files (root is the dir itself). depth 1: root.txt.
+	// level1/one.txt is depth 2, so excluded.
+	for _, e := range result.Entries {
+		if e.Path != "root.txt" {
+			t.Errorf("entry %q exceeded max_depth=1", e.Path)
+		}
+	}
+}
+
+func TestFindFiles_ModifiedSince(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(root, 0755)
+	oldFile := filepath.Join(root, "old.log")
+	newFile := filepath.Join(root, "new.log")
+	os.WriteFile(oldFile, []byte("old"), 0644)
+	os.WriteFile(newFile, []byte("new"), 0644)
+	past := time.Now().Add(-48 * time.Hour)
+	future := time.Now().Add(48 * time.Hour)
+	if err := os.Chtimes(oldFile, past, past); err != nil {
+		t.Fatalf("chtimes old: %v", err)
+	}
+	if err := os.Chtimes(newFile, future, future); err != nil {
+		t.Fatalf("chtimes new: %v", err)
+	}
+
+	cutoff := time.Now()
+	result, err := c.FindFiles("myserver", "", FindOpts{Type: "f", ModifiedSince: cutoff})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Path != "new.log" {
+		t.Errorf("entries = %+v, want only new.log", result.Entries)
+	}
+}
+
+func TestFindFiles_SkipExts(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(root, 0755)
+	os.WriteFile(filepath.Join(root, "app.log"), []byte("x"), 0644)
+	os.WriteFile(filepath.Join(root, ".env"), []byte("x"), 0644)
+
+	result, err := c.FindFiles("myserver", "", FindOpts{SkipExts: []string{".env"}})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	for _, e := range result.Entries {
+		if strings.HasSuffix(e.Path, ".env") {
+			t.Errorf("entry %q slipped past SkipExts", e.Path)
+		}
+	}
+}
+
+func TestFindFiles_SymlinkSkip(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(root, 0755)
+	target := filepath.Join(root, "real.txt")
+	link := filepath.Join(root, "link.txt")
+	os.WriteFile(target, []byte("x"), 0644)
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	result, err := c.FindFiles("myserver", "", FindOpts{Type: "f"})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	for _, e := range result.Entries {
+		if filepath.Base(e.Path) == "link.txt" {
+			t.Errorf("symlink %q was not skipped", e.Path)
+		}
+	}
+}
+
+func TestFindFiles_Truncation(t *testing.T) {
+	c, base := newTestClient(t)
+	root := filepath.Join(base, "myserver")
+	os.MkdirAll(root, 0755)
+	for i := 0; i < 5; i++ {
+		os.WriteFile(filepath.Join(root, "f"+strconv.Itoa(i)+".txt"), []byte("x"), 0644)
+	}
+
+	result, err := c.FindFiles("myserver", "", FindOpts{Type: "f", MaxEntries: 2})
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Errorf("entries = %d, want 2", len(result.Entries))
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+}
+
+func TestFindFiles_InvalidGlob(t *testing.T) {
+	c, base := newTestClient(t)
+	os.MkdirAll(filepath.Join(base, "myserver"), 0755)
+
+	_, err := c.FindFiles("myserver", "", FindOpts{NameGlob: "[invalid"})
+	if err == nil {
+		t.Fatal("expected error for malformed glob, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid name_glob") {
+		t.Errorf("error = %v, want invalid name_glob", err)
 	}
 }
 

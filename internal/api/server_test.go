@@ -31,6 +31,10 @@ type mockNFS struct {
 	readFileErr      error
 	grepResult       *nfs.GrepResult
 	grepErr          error
+	grepCapture      *nfs.GrepOpts
+	findResult       *nfs.FindResult
+	findErr          error
+	findCapture      *nfs.FindOpts
 	backups          []nfs.BackupInfo
 	listBackErr      error
 	backupID         string
@@ -68,8 +72,15 @@ func (m *mockNFS) ListFiles(string, string) ([]nfs.FileEntry, error) {
 	return m.files, m.listFilesErr
 }
 func (m *mockNFS) ReadFile(string, string) ([]byte, error) { return m.fileContent, m.readFileErr }
-func (m *mockNFS) GrepFiles(string, string, string) (*nfs.GrepResult, error) {
+func (m *mockNFS) GrepFiles(_, _, _ string, opts nfs.GrepOpts) (*nfs.GrepResult, error) {
+	capture := opts
+	m.grepCapture = &capture
 	return m.grepResult, m.grepErr
+}
+func (m *mockNFS) FindFiles(_, _ string, opts nfs.FindOpts) (*nfs.FindResult, error) {
+	capture := opts
+	m.findCapture = &capture
+	return m.findResult, m.findErr
 }
 func (m *mockNFS) ListBackups(string) ([]nfs.BackupInfo, error) { return m.backups, m.listBackErr }
 func (m *mockNFS) StartBackup(string, int, int) (string, error) { return m.backupID, m.startBackErr }
@@ -434,12 +445,26 @@ func TestReadFileMissingPath(t *testing.T) {
 // --- Grep ---
 
 func TestGrepFiles(t *testing.T) {
-	result := &nfs.GrepResult{Lines: []string{"match1"}, Count: 1}
-	s := newTestServer(&mockNFS{grepResult: result})
+	result := &nfs.GrepResult{
+		Matches: []nfs.GrepMatch{{Path: "logs/app.log", Line: 1, Text: "ERROR"}},
+		Count:   1,
+	}
+	m := &mockNFS{grepResult: result}
+	s := newTestServer(m)
 	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/grep?path=logs&pattern=ERROR", nil)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	var body nfs.GrepResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Count != 1 || len(body.Matches) != 1 || body.Matches[0].Path != "logs/app.log" {
+		t.Errorf("body = %+v, want Count=1 Matches=[logs/app.log:1:ERROR]", body)
+	}
+	if m.grepCapture == nil || m.grepCapture.CaseInsensitive {
+		t.Errorf("opts = %+v, want CaseInsensitive=false by default", m.grepCapture)
 	}
 }
 
@@ -449,6 +474,98 @@ func TestGrepFilesMissingPattern(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestGrepFilesOptions(t *testing.T) {
+	m := &mockNFS{grepResult: &nfs.GrepResult{Matches: []nfs.GrepMatch{}, Count: 0}}
+	s := newTestServer(m)
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/grep?pattern=api&case_insensitive=true&skip_exts=.env,.key", nil)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	if m.grepCapture == nil {
+		t.Fatal("grep options not captured")
+	}
+	if !m.grepCapture.CaseInsensitive {
+		t.Errorf("CaseInsensitive = false, want true")
+	}
+	if len(m.grepCapture.SkipExts) != 2 || m.grepCapture.SkipExts[0] != ".env" || m.grepCapture.SkipExts[1] != ".key" {
+		t.Errorf("SkipExts = %+v, want [.env .key]", m.grepCapture.SkipExts)
+	}
+}
+
+func TestGrepFilesBadBool(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/grep?pattern=api&case_insensitive=maybe", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// --- Find ---
+
+func TestFindFilesBasic(t *testing.T) {
+	result := &nfs.FindResult{
+		Entries: []nfs.DirEntry{{Path: "data/2026-04-20.csv", Type: "file", Size: 8}},
+	}
+	m := &mockNFS{findResult: result}
+	s := newTestServer(m)
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/find?name_glob=*.csv&type=f&max_depth=2&max_entries=100&skip_exts=.env", nil)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	if m.findCapture == nil {
+		t.Fatal("find options not captured")
+	}
+	if m.findCapture.NameGlob != "*.csv" {
+		t.Errorf("NameGlob = %q, want *.csv", m.findCapture.NameGlob)
+	}
+	if m.findCapture.Type != "f" {
+		t.Errorf("Type = %q, want f", m.findCapture.Type)
+	}
+	if m.findCapture.MaxDepth != 2 {
+		t.Errorf("MaxDepth = %d, want 2", m.findCapture.MaxDepth)
+	}
+	if m.findCapture.MaxEntries != 100 {
+		t.Errorf("MaxEntries = %d, want 100", m.findCapture.MaxEntries)
+	}
+	if len(m.findCapture.SkipExts) != 1 || m.findCapture.SkipExts[0] != ".env" {
+		t.Errorf("SkipExts = %+v, want [.env]", m.findCapture.SkipExts)
+	}
+}
+
+func TestFindFilesBadType(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/find?type=socket", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestFindFilesBadModifiedSince(t *testing.T) {
+	s := newTestServer(&mockNFS{})
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/find?modified_since=yesterday", nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestFindFilesEntriesNormalized(t *testing.T) {
+	m := &mockNFS{findResult: &nfs.FindResult{Entries: nil}}
+	s := newTestServer(m)
+	rr := doRequest(s.Handler(), "GET", "/servers/mc-test/files/find", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body nfs.FindResult
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Entries == nil {
+		t.Error("entries should be [], got null")
 	}
 }
 

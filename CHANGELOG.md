@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-04-20
+
+### Added
+- `GET /servers/{name}/files/find` — find entries under a server directory. Query params: `path` (relative, default root), `name_glob` (optional, matched against basename via `filepath.Match`), `type` (`f` or `d`, empty = both), `max_depth` (positive int = cap depth relative to `path`; zero or negative = unlimited), `modified_since` (RFC3339), `skip_exts` (comma list of extensions to skip), `max_entries` (default 1000, hard cap 10000). Returns `{"entries":[{"path","type","size","mtime"}], "truncated":bool}`. Symlinks are skipped (not followed, not reported). A malformed `name_glob` returns 400.
+- `GET /servers/{name}/files/grep` gained `case_insensitive` (bool) and `skip_exts` (comma list) query params. Files whose extension matches `skip_exts` are passed to `grep` as `--exclude` patterns so they are never opened.
+
+### Changed
+- **BREAKING:** `GET /servers/{name}/files/grep` response shape. Previously `matches` was `[]string` in `path:line:text` form (ambiguous for filenames containing colons). Now `matches` is `[{"path","line","text"}]` with `path` relative to the server root. Gateway now invokes `grep -rnZIH` and parses NUL-separated output so filenames containing colons are handled correctly. No known external consumers of the old shape at time of change.
+
 ## [v1.2.0] - 2026-04-16
 
 ### Added

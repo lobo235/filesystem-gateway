@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,8 +55,14 @@ type Client interface {
 	ListFiles(serverName, subPath string) ([]FileEntry, error)
 	// ReadFile reads a file's contents (max 1MB).
 	ReadFile(serverName, subPath string) ([]byte, error)
-	// GrepFiles runs grep on a path within a server directory.
-	GrepFiles(serverName, subPath, pattern string) (*GrepResult, error)
+	// GrepFiles runs grep on a path within a server directory. subPath may
+	// point at a file or a directory (recursive). Paths in the returned
+	// matches are relative to the server root.
+	GrepFiles(serverName, subPath, pattern string, opts GrepOpts) (*GrepResult, error)
+	// FindFiles walks a path within a server directory and returns entries
+	// matching the supplied filters. Symlinks are skipped. Paths in the
+	// result are relative to the server root.
+	FindFiles(serverName, subPath string, opts FindOpts) (*FindResult, error)
 	// ListBackups returns available backups for a server.
 	ListBackups(serverName string) ([]BackupInfo, error)
 	// StartBackup triggers an async backup, returning the backup ID.
@@ -114,11 +122,66 @@ type FileEntry struct {
 	ModTime string `json:"mod_time"`
 }
 
-// GrepResult holds grep output.
+// GrepMatch is one hit within GrepResult.Matches. Path is relative to the
+// server root (never exposes the NFS base path). Line is 1-indexed. Text is
+// the matching line with any trailing newline stripped.
+type GrepMatch struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Text string `json:"text"`
+}
+
+// GrepResult holds the outcome of a GrepFiles call. Matches is empty (not nil)
+// when nothing hit. Truncated signals that maxGrepLines or maxGrepBytes was
+// reached before the walker finished.
 type GrepResult struct {
-	Lines     []string `json:"lines"`
-	Count     int      `json:"count"`
-	Truncated bool     `json:"truncated"`
+	Matches   []GrepMatch `json:"matches"`
+	Count     int         `json:"count"`
+	Truncated bool        `json:"truncated"`
+}
+
+// GrepOpts carries optional knobs for GrepFiles.
+//   - CaseInsensitive: pass grep -i.
+//   - SkipExts: extensions (with or without leading dot, case-insensitive) of
+//     files grep must not open. The gateway also post-filters matches by the
+//     same list as defence in depth, in case a caller shells around the
+//     --exclude flag.
+type GrepOpts struct {
+	CaseInsensitive bool
+	SkipExts        []string
+}
+
+// FindOpts carries filters for FindFiles. Zero-value fields behave as "no
+// filter" so callers can populate only what they need.
+//
+//   - NameGlob: shell-style pattern (filepath.Match) matched against each
+//     entry's basename. Empty matches every entry.
+//   - Type: "f" keeps files only, "d" keeps directories only, "" keeps both.
+//   - MaxDepth: zero or negative disables the limit (default — walk the
+//     whole subtree). When positive, entries whose depth below subPath
+//     exceeds MaxDepth are dropped. Depth 1 = immediate children,
+//     depth 2 = grandchildren, etc. subPath itself is depth 0 and is
+//     always considered if it passes the other filters.
+//   - ModifiedSince: entries whose mtime is strictly before this instant are
+//     dropped. Zero value disables the filter.
+//   - SkipExts: same semantics as GrepOpts.SkipExts — extensions whose
+//     matching entries are always dropped.
+//   - MaxEntries: hard cap on the returned slice. 0 uses the package default.
+//     Once reached, Truncated is set and the walk stops early.
+type FindOpts struct {
+	NameGlob      string
+	Type          string
+	MaxDepth      int
+	ModifiedSince time.Time
+	SkipExts      []string
+	MaxEntries    int
+}
+
+// FindResult is the wire-level envelope returned by FindFiles. Entries is
+// empty (not nil) when nothing matched.
+type FindResult struct {
+	Entries   []DirEntry `json:"entries"`
+	Truncated bool       `json:"truncated"`
 }
 
 // BackupInfo describes an available backup file.
@@ -664,45 +727,312 @@ func (c *client) ReadFileEx(serverName, subPath string, maxBytes int64, originEn
 	return buf[:n], truncated, nil
 }
 
-// GrepFiles runs grep on a path within a server directory.
-func (c *client) GrepFiles(serverName, subPath, pattern string) (*GrepResult, error) {
+// GrepFiles runs grep on a path within a server directory. Uses
+// `grep -rnZIH`: recursive, with line numbers, NUL-separator between filename
+// and line data (so paths containing colons parse unambiguously), binary
+// files skipped, filename always printed (even when the target is a single
+// file). Paths in the returned matches are rewritten relative to the server
+// root so the NFS base path never leaks back to callers.
+func (c *client) GrepFiles(serverName, subPath, pattern string, opts GrepOpts) (*GrepResult, error) {
 	target, err := c.SafePath(serverName, subPath)
 	if err != nil {
 		return nil, err
 	}
-	// Use grep with recursive flag for directories. Timeout after 30s to prevent DoS.
+	serverRoot, err := c.SafePath(serverName)
+	if err != nil {
+		return nil, err
+	}
+	skipExts := normalizeExts(opts.SkipExts)
+
+	// Timeout after 30s to prevent DoS via pathological patterns on large trees.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	args := []string{"-rn", "--", pattern, target}
+
+	args := make([]string, 0, 6+len(skipExts))
+	args = append(args, "-rnZIH")
+	if opts.CaseInsensitive {
+		args = append(args, "-i")
+	}
+	for _, ext := range skipExts {
+		// grep --exclude uses shell-style globs; "*<ext>" matches any basename ending in ext.
+		args = append(args, "--exclude=*"+ext)
+	}
+	args = append(args, "--", pattern, target)
+
 	cmd := exec.CommandContext(ctx, "grep", args...)
 	out, err := cmd.Output()
-	// grep returns exit code 1 when no matches found — that's not an error.
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return &GrepResult{Lines: []string{}, Count: 0}, nil
+			return &GrepResult{Matches: []GrepMatch{}, Count: 0}, nil
 		}
 		return nil, fmt.Errorf("grep: %w", err)
 	}
 
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	rawLines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	result := make([]GrepMatch, 0, len(rawLines))
 	truncated := false
 	totalBytes := 0
 
-	var result []string
-	for _, line := range lines {
+	for _, line := range rawLines {
+		if line == "" {
+			continue
+		}
+		// grep -Z emits FILENAME\0LINENO:TEXT per match.
+		nulIdx := strings.IndexByte(line, 0)
+		if nulIdx < 0 {
+			continue
+		}
+		path := line[:nulIdx]
+		rest := line[nulIdx+1:]
+		colonIdx := strings.IndexByte(rest, ':')
+		if colonIdx < 0 {
+			continue
+		}
+		lineno, convErr := strconv.Atoi(rest[:colonIdx])
+		if convErr != nil {
+			continue
+		}
+		text := rest[colonIdx+1:]
+
+		// Defence in depth: reject SkipExts hits even if --exclude didn't.
+		if matchesExt(path, skipExts) {
+			continue
+		}
+
+		// Rewrite to a path relative to the server root.
+		if rel, relErr := filepath.Rel(serverRoot, path); relErr == nil {
+			path = rel
+		}
+
 		totalBytes += len(line) + 1
 		if len(result) >= maxGrepLines || totalBytes > maxGrepBytes {
 			truncated = true
 			break
 		}
-		result = append(result, line)
+		result = append(result, GrepMatch{Path: path, Line: lineno, Text: text})
 	}
 
 	return &GrepResult{
-		Lines:     result,
+		Matches:   result,
 		Count:     len(result),
 		Truncated: truncated,
 	}, nil
+}
+
+// normalizeExts lowercases each ext and ensures a leading dot so callers can
+// pass either "env" or ".env".
+func normalizeExts(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		e := strings.TrimSpace(strings.ToLower(raw))
+		if e == "" {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// matchesExt reports whether path's lowercased basename ends in any ext.
+func matchesExt(path string, exts []string) bool {
+	if len(exts) == 0 {
+		return false
+	}
+	lower := strings.ToLower(filepath.Base(path))
+	for _, e := range exts {
+		if strings.HasSuffix(lower, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// FindFiles walks a server-scoped path and returns entries that pass every
+// filter in opts. Symlinks are skipped (matching ListDir). Paths in the
+// result are server-root-relative slash-style so callers can compose them
+// with other filesystem tools without post-processing.
+//
+// MaxDepth semantics: subPath itself is depth 0. Immediate children are
+// depth 1. A MaxDepth of zero or less disables the limit. When the walker
+// reaches a directory at the depth limit, that directory is emitted (if it
+// passes the other filters) but is not descended into.
+func (c *client) FindFiles(serverName, subPath string, opts FindOpts) (*FindResult, error) {
+	serverRoot, target, err := c.resolveFindTarget(serverName, subPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateFindOpts(opts); err != nil {
+		return nil, err
+	}
+	maxEntries := opts.MaxEntries
+	if maxEntries <= 0 {
+		maxEntries = 1000
+	}
+	skipExts := normalizeExts(opts.SkipExts)
+
+	entries := make([]DirEntry, 0)
+	truncated := false
+	walkFn := findWalkFunc(serverRoot, target, opts, skipExts, maxEntries, &entries, &truncated)
+	if err := filepath.WalkDir(target, walkFn); err != nil {
+		return nil, fmt.Errorf("find: %w", err)
+	}
+	return &FindResult{Entries: entries, Truncated: truncated}, nil
+}
+
+// resolveFindTarget validates the server exists and the subPath points at a
+// directory inside it; returns the server root and resolved target path.
+func (c *client) resolveFindTarget(serverName, subPath string) (string, string, error) {
+	serverRoot, err := c.SafePath(serverName)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := os.Stat(serverRoot); err != nil {
+		if os.IsNotExist(err) {
+			return "", "", fmt.Errorf("server not found: %s", serverName)
+		}
+		return "", "", fmt.Errorf("stat server: %w", err)
+	}
+	target, err := c.serverScopedPath(serverName, subPath)
+	if err != nil {
+		return "", "", err
+	}
+	if err := checkIsDir(target, subPath); err != nil {
+		return "", "", err
+	}
+	return serverRoot, target, nil
+}
+
+func validateFindOpts(opts FindOpts) error {
+	if opts.NameGlob != "" {
+		// Smoke-test the glob so malformed patterns fail fast instead of
+		// silently matching nothing after an expensive walk.
+		if _, err := filepath.Match(opts.NameGlob, "a"); err != nil {
+			return fmt.Errorf("invalid name_glob: %w", err)
+		}
+	}
+	switch opts.Type {
+	case "", "f", "d":
+		return nil
+	default:
+		return fmt.Errorf("invalid type %q (want \"f\", \"d\", or \"\")", opts.Type)
+	}
+}
+
+func findWalkFunc(serverRoot, target string, opts FindOpts, skipExts []string, maxEntries int, entries *[]DirEntry, truncated *bool) fs.WalkDirFunc {
+	return func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if path == target {
+				return err
+			}
+			return nil
+		}
+		fi, skip := findEntryInfo(d)
+		if skip {
+			if d.IsDir() && fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		depth, overDepth := findEntryDepth(path, target, opts.MaxDepth)
+		if overDepth {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if findEntryMatches(path, d, fi, opts, skipExts) {
+			if len(*entries) >= maxEntries {
+				*truncated = true
+				return filepath.SkipAll
+			}
+			if entry, ok := makeFindEntry(serverRoot, path, fi); ok {
+				*entries = append(*entries, entry)
+			}
+		}
+		if d.IsDir() && opts.MaxDepth > 0 && depth >= opts.MaxDepth {
+			return filepath.SkipDir
+		}
+		return nil
+	}
+}
+
+// findEntryInfo returns the FileInfo if the entry is a candidate, or skip=true
+// if WalkDir should drop it (symlink, non-regular, or Info error).
+func findEntryInfo(d os.DirEntry) (os.FileInfo, bool) {
+	fi, err := d.Info()
+	if err != nil {
+		return nil, true
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fi, true
+	}
+	if !fi.Mode().IsRegular() && !fi.IsDir() {
+		return fi, true
+	}
+	return fi, false
+}
+
+// findEntryDepth computes the depth of path relative to target (target = 0,
+// immediate children = 1, ...) and whether that depth is past the MaxDepth cap.
+func findEntryDepth(path, target string, maxDepth int) (int, bool) {
+	rel, err := filepath.Rel(target, path)
+	if err != nil {
+		return 0, false
+	}
+	depth := 0
+	if rel != "." {
+		depth = 1 + strings.Count(rel, string(filepath.Separator))
+	}
+	over := maxDepth > 0 && depth > maxDepth
+	return depth, over
+}
+
+// findEntryMatches applies the type / name_glob / modified_since / skip_exts
+// filters. Assumes symlinks and non-regular entries are already filtered out.
+func findEntryMatches(path string, d os.DirEntry, fi os.FileInfo, opts FindOpts, skipExts []string) bool {
+	if opts.Type == "f" && d.IsDir() {
+		return false
+	}
+	if opts.Type == "d" && !d.IsDir() {
+		return false
+	}
+	if opts.NameGlob != "" {
+		if ok, _ := filepath.Match(opts.NameGlob, filepath.Base(path)); !ok {
+			return false
+		}
+	}
+	if !opts.ModifiedSince.IsZero() && fi.ModTime().Before(opts.ModifiedSince) {
+		return false
+	}
+	if matchesExt(path, skipExts) {
+		return false
+	}
+	return true
+}
+
+// makeFindEntry builds a DirEntry with a server-root-relative path. Returns
+// ok=false if the relative path can't be computed (caller skips silently).
+func makeFindEntry(serverRoot, path string, fi os.FileInfo) (DirEntry, bool) {
+	relServer, err := filepath.Rel(serverRoot, path)
+	if err != nil {
+		return DirEntry{}, false
+	}
+	t := "file"
+	if fi.IsDir() {
+		t = "dir"
+	}
+	return DirEntry{
+		Path:    filepath.ToSlash(relServer),
+		Type:    t,
+		Size:    fi.Size(),
+		ModTime: fi.ModTime().UTC().Format(time.RFC3339),
+	}, true
 }
 
 // ListBackups returns available .tar.zst backup files for a server.

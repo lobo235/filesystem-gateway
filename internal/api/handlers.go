@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/lobo235/filesystem-gateway/internal/nfs"
@@ -350,13 +351,28 @@ func (s *Server) grepFilesHandler() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
 			return
 		}
-		subPath := r.URL.Query().Get("path")
-		pattern := r.URL.Query().Get("pattern")
+		q := r.URL.Query()
+		subPath := q.Get("path")
+		pattern := q.Get("pattern")
 		if pattern == "" {
 			writeError(w, http.StatusBadRequest, "missing_fields", "pattern query parameter is required")
 			return
 		}
-		result, err := s.nfs.GrepFiles(name, subPath, pattern)
+
+		opts := nfs.GrepOpts{}
+		if v := q.Get("case_insensitive"); v != "" {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_body", "case_insensitive must be a boolean")
+				return
+			}
+			opts.CaseInsensitive = parsed
+		}
+		if v := q.Get("skip_exts"); v != "" {
+			opts.SkipExts = splitCSV(v)
+		}
+
+		result, err := s.nfs.GrepFiles(name, subPath, pattern, opts)
 		if err != nil {
 			if errors.Is(err, nfs.ErrPathTraversal) {
 				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
@@ -368,6 +384,112 @@ func (s *Server) grepFilesHandler() http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, result)
 	}
+}
+
+// findFilesHandler handles GET /servers/{name}/files/find.
+//
+// Query params (all optional except `name` from path):
+//   - path: subdirectory to walk (defaults to server root)
+//   - name_glob: filepath.Match pattern against each entry's basename
+//   - type: "f" (files only), "d" (dirs only), empty (both)
+//   - max_depth: integer, negative = unlimited (default -1)
+//   - modified_since: RFC3339 timestamp; drops earlier entries
+//   - skip_exts: comma-separated extensions to drop from results
+//   - max_entries: positive integer, capped at lsHardMaxEntries
+func (s *Server) findFilesHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if !validServerName(name) {
+			writeError(w, http.StatusBadRequest, "invalid_body", "invalid server name")
+			return
+		}
+		q := r.URL.Query()
+
+		opts := nfs.FindOpts{}
+		opts.NameGlob = q.Get("name_glob")
+		opts.Type = q.Get("type")
+		switch opts.Type {
+		case "", "f", "d":
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_body", `type must be "f", "d", or empty`)
+			return
+		}
+		if v := q.Get("max_depth"); v != "" {
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_body", "max_depth must be an integer")
+				return
+			}
+			opts.MaxDepth = parsed
+		}
+		if v := q.Get("modified_since"); v != "" {
+			parsed, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_body", "modified_since must be RFC3339")
+				return
+			}
+			opts.ModifiedSince = parsed
+		}
+		if v := q.Get("skip_exts"); v != "" {
+			opts.SkipExts = splitCSV(v)
+		}
+		opts.MaxEntries = lsDefaultMaxEntries
+		if v := q.Get("max_entries"); v != "" {
+			parsed, err := strconv.Atoi(v)
+			if err != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid_body", "max_entries must be a positive integer")
+				return
+			}
+			opts.MaxEntries = parsed
+		}
+		if opts.MaxEntries > lsHardMaxEntries {
+			opts.MaxEntries = lsHardMaxEntries
+		}
+
+		subPath := q.Get("path")
+		result, err := s.nfs.FindFiles(name, subPath, opts)
+		if err != nil {
+			if errors.Is(err, nfs.ErrPathTraversal) {
+				writeError(w, http.StatusBadRequest, "path_traversal", "path traversal detected")
+				return
+			}
+			if strings.Contains(err.Error(), "invalid name_glob") || strings.Contains(err.Error(), "invalid type") {
+				writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "server not found") {
+				writeError(w, http.StatusNotFound, "server_not_found", err.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "path not found") {
+				writeError(w, http.StatusNotFound, "path_not_found", err.Error())
+				return
+			}
+			s.log.Error("find files failed", "error", err, "server", name, "trace_id", traceIDFromContext(r.Context()))
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to find files")
+			return
+		}
+		if result.Entries == nil {
+			result.Entries = []nfs.DirEntry{}
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+// splitCSV splits a comma-separated value, trimming whitespace and dropping empties.
+func splitCSV(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // --- Backup operations ---
