@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/lobo235/filesystem-gateway/internal/api"
@@ -16,6 +18,15 @@ import (
 var version = "dev"
 
 func main() {
+	// Handle --version before any config loading so the binary stays usable
+	// even when env vars are absent.
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-version" || arg == "-v" {
+			fmt.Printf("filesystem-gateway version %s %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
+			return
+		}
+	}
+
 	// Bootstrap logger at INFO so we can log config errors before cfg is loaded.
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 

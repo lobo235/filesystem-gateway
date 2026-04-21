@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.0.1] - 2026-04-20
+
+### Fixed
+- `--version` (and `-version`, `-v`) now prints `filesystem-gateway version <semver> <os>/<arch>` and exits before any config loading. Previously the flag was ignored and the binary fell through to config validation, which aborted with an `NFS_BASE_PATH is required` error when env vars were absent.
+
 ## [v2.0.0] - 2026-04-20
 
 ### Added
